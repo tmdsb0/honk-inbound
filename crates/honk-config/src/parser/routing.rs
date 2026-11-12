@@ -356,7 +356,11 @@ fn parse_outbound(
         }
         return Ok(("direct".into(), must, mark.unwrap_or(0)));
     }
-    let mut outbound = target.display();
+    // Node/group names may be quoted (node names often contain spaces,
+    // punctuation or non-ASCII). Strip a single pair of surrounding quotes so
+    // the outbound matches the declared node/group name exactly. Bare names
+    // are unaffected. `direct(must)` was handled above and never reaches here.
+    let mut outbound = target.unquote().display();
     let must = outbound.ends_with("(must)");
     if must {
         outbound.truncate(outbound.len() - "(must)".len());

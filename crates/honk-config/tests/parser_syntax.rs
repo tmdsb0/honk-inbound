@@ -616,3 +616,27 @@ routing {
         );
     }
 }
+
+mod routing_outbound_quotes {
+    use honk_config::parser::parse_dae_config;
+    use honk_config::routing::RoutingOutbound;
+
+    #[test]
+    fn quoted_node_name_outbound_is_unquoted() {
+        let input = "\
+node {
+    '香港-中兴(qzhk)': 'socks5://127.0.0.1:1080#node'
+}
+routing {
+    inbound(shop) -> '香港-中兴(qzhk)'
+    fallback: direct
+}
+";
+        let config = parse_dae_config(input).unwrap();
+        match &config.routing.rules[0].outbound {
+            RoutingOutbound::Simple(name) => assert_eq!(name, "香港-中兴(qzhk)"),
+            other => panic!("unexpected outbound: {other:?}"),
+        }
+        assert!(config.validate().is_ok());
+    }
+}

@@ -1037,17 +1037,20 @@ impl Config {
             })
         };
         let check_outbound = |target: &str, index: Option<usize>| {
+            // A routing target may be a builtin, `follow`, a declared group,
+            // or a bare node name. The dial path (resolve_outbound_nodes)
+            // already resolves node names to a single-node outbound, and the
+            // `inbound()` documentation has always advertised direct node
+            // targets — so validation must accept them too. Only genuinely
+            // unknown names are rejected.
             if matches!(target, Self::BUILTIN_DIRECT_NODE | Self::BUILTIN_BLOCK_NODE)
                 || target.eq_ignore_ascii_case("follow")
                 || self.groups.iter().any(|group| group.name == target)
+                || is_config_node(target)
             {
                 return Ok(());
             }
-            let message = if is_config_node(target) {
-                "routing target names a node; use a group"
-            } else {
-                "routing target is not a declared group or builtin"
-            };
+            let message = "routing target is not a declared group, node or builtin";
             let setting = match index {
                 Some(index) => SettingPath::new("routing")
                     .field("rules")
@@ -2035,23 +2038,22 @@ mod builtin_nodes_tests {
     }
 
     #[test]
-    fn test_validate_rejects_bare_node_outbounds() {
+    fn test_validate_accepts_bare_node_outbounds() {
         let mut config = Config::default();
         config.nodes.push(test_node("vn"));
 
         config.routing.rules.push(rule_to("vn"));
-        let error = config.validate_detailed().unwrap_err();
-        assert_eq!(error.diagnostic.code, "unknown-routing-target");
-        assert_eq!(
-            error.diagnostic.setting.to_string(),
-            "routing.rules[1].outbound"
+        assert!(
+            config.validate().is_ok(),
+            "rule must accept a bare node name"
         );
 
         config.routing.rules.clear();
         config.routing.default_outbound = "vn".into();
-        let error = config.validate_detailed().unwrap_err();
-        assert_eq!(error.diagnostic.code, "unknown-routing-target");
-        assert_eq!(error.diagnostic.setting.to_string(), "routing.fallback");
+        assert!(
+            config.validate().is_ok(),
+            "fallback must accept a bare node name"
+        );
     }
 
     #[test]
