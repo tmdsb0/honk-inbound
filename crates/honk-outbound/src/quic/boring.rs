@@ -23,7 +23,11 @@ use std::sync::{Arc, LazyLock};
 use aes::cipher::{BlockCipherEncrypt, KeyInit};
 use boring::aead::{AeadCtx, Algorithm as AeadAlgorithm};
 use boring::error::ErrorStack;
-use boring::ssl::{Ssl, SslContext, SslContextBuilder, SslMethod, SslVerifyMode, SslVersion};
+use boring::pkey::{PKey, Public};
+use boring::ssl::{
+    Ssl, SslAlert, SslContext, SslContextBuilder, SslMethod, SslRef, SslVerifyError,
+    SslVerifyMode, SslVersion,
+};
 use bytes::BytesMut;
 use foreign_types::ForeignTypeRef;
 use hkdf::Hkdf;
@@ -526,6 +530,18 @@ pub struct BoringQuicOptions {
     /// pinSHA256 leaf-certificate fingerprint; replaces PKI and hostname
     /// verification when set.
     pub pin_sha256: Option<[u8; 32]>,
+    /// WARP MASQUE device identity: a self-signed client certificate over the
+    /// device's P-256 key. The edge recognises the device by this key, so a
+    /// QUIC handshake without it is refused even with a valid pin. Pair with
+    /// `client_private_key`; setting one without the other is an error.
+    pub client_certificate: Option<boring::x509::X509>,
+    /// Private half of [`Self::client_certificate`].
+    pub client_private_key: Option<boring::pkey::PKey<boring::pkey::Private>>,
+    /// WARP MASQUE endpoint identity: the exact public key the edge's leaf
+    /// certificate must carry. The decoy SNI means neither PKI nor hostname
+    /// verification can be used, so this replaces both. Takes precedence over
+    /// `pin_sha256` and `skip_cert_verify`.
+    pub endpoint_public_key: Option<boring::pkey::PKey<boring::pkey::Public>>,
     /// Server-identity component of the ticket key (defaults to the server
     /// name). Include SNI|port to separate servers sharing a certificate;
     /// the backend adds the certificate-verification policy.
@@ -545,6 +561,27 @@ pub struct BoringQuicClientConfig {
     ticket_key: Option<String>,
 }
 
+/// Accept the QUIC peer only when its leaf certificate carries the pinned key.
+///
+/// WARP's SNI is a decoy, so neither hostname verification nor a CA chain can
+/// authenticate the edge. Comparing the leaf's public key is what the TCP
+/// carrier does (`proxy/masque/warp.rs`); the QUIC path must do the same.
+fn pin_endpoint_public_key(
+    pinned: PKey<Public>,
+) -> impl Fn(&mut SslRef) -> Result<(), SslVerifyError> + Send + Sync + 'static {
+    move |ssl| {
+        let matches = ssl
+            .peer_certificate()
+            .and_then(|certificate| certificate.public_key().ok())
+            .is_some_and(|key| key.public_eq(&pinned));
+        if matches {
+            Ok(())
+        } else {
+            Err(SslVerifyError::Invalid(SslAlert::BAD_CERTIFICATE))
+        }
+    }
+}
+
 impl BoringQuicClientConfig {
     /// Build the config from [`BoringQuicOptions`].
     pub fn new(options: BoringQuicOptions) -> anyhow::Result<Self> {
@@ -554,6 +591,9 @@ impl BoringQuicClientConfig {
             chrome,
             ech_config_list,
             pin_sha256,
+            client_certificate,
+            client_private_key,
+            endpoint_public_key,
             ticket_key,
         } = options;
         let mut builder = SslContextBuilder::new(SslMethod::tls())?;
@@ -561,7 +601,30 @@ impl BoringQuicClientConfig {
         builder.set_min_proto_version(Some(SslVersion::TLS1_3))?;
         builder.set_max_proto_version(Some(SslVersion::TLS1_3))?;
 
-        if let Some(pin) = pin_sha256 {
+        // WARP's edge asks for a client certificate and identifies the device
+        // by its key. Present it before the handshake starts, or the edge has
+        // nothing to recognise. Both halves are required together.
+        match (client_certificate, client_private_key) {
+            (Some(certificate), Some(key)) => {
+                builder.set_certificate(&certificate)?;
+                builder.set_private_key(&key)?;
+            }
+            (None, None) => {}
+            _ => anyhow::bail!(
+                "QUIC client identity needs both a certificate and a private key"
+            ),
+        }
+
+        let has_endpoint_pin = endpoint_public_key.is_some();
+        if let Some(pinned) = endpoint_public_key {
+            // The SNI is a decoy (www.microsoft.com in the wild), so PKI and
+            // hostname verification would always fail. Pin the leaf's public
+            // key exactly as the TCP WARP carrier does.
+            builder.set_custom_verify_callback(
+                SslVerifyMode::PEER,
+                pin_endpoint_public_key(pinned),
+            );
+        } else if let Some(pin) = pin_sha256 {
             // pinSHA256: fingerprint check replaces PKI + hostname checks.
             builder.set_custom_verify_callback(
                 SslVerifyMode::PEER,
@@ -593,7 +656,10 @@ impl BoringQuicClientConfig {
             alpn_wire,
             chrome,
             ech_config_list,
-            has_pin: pin_sha256.is_some(),
+            // A resumed PSK skips certificate verification, which would let a
+            // connection bypass either kind of pin. Keep the pin variants on
+            // the same no-resumption path.
+            has_pin: has_endpoint_pin || pin_sha256.is_some(),
             skip_cert_verify,
             ticket_key,
         })

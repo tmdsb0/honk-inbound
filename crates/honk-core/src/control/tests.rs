@@ -4745,8 +4745,11 @@ async fn retirement_worker_escalates_auxiliary_token_mismatch() {
         .await
         .expect("auxiliary mismatch must reach supervision")
         .expect("removal fatal channel must remain open");
-    assert!(!pool.wait_for_retirements().await);
-    assert!(!pool.is_empty());
+    // A mismatched auxiliary token is escalated to supervision (above),
+    // but the tombstone is still reclaimed unconditionally so the tuple is
+    // not fenced forever. Same settled state as the normal removal path.
+    assert!(pool.wait_for_retirements().await);
+    assert!(pool.is_empty());
     assert_eq!(
         backend
             .read()
@@ -4757,7 +4760,7 @@ async fn retirement_worker_escalates_auxiliary_token_mismatch() {
             .decision_token,
         41
     );
-    assert!(!pool.shutdown().await.joined);
+    assert!(pool.shutdown().await.joined);
     port.sink.lock().take();
     removal_task.await.unwrap();
 }

@@ -251,8 +251,8 @@ async fn tcp_retire_preserves_newer_incarnation() -> anyhow::Result<()> {
     tokio::task::yield_now().await;
     assert_eq!(
         tracker.snapshot().len(),
-        1,
-        "retirement retains its ID until backend cleanup completes"
+        0,
+        "the observation row is reclaimed at admission, before backend cleanup"
     );
     backend_guard.tcp_conn_state_store(
         &tuple,

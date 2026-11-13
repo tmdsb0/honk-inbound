@@ -30,7 +30,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 /// SNI Cloudflare's consumer WARP endpoints are registered under. A node may
 /// override it to masquerade as unrelated HTTPS traffic.
-const DEFAULT_SNI: &str = "consumer-masque.cloudflareclient.com";
+pub(super) const DEFAULT_SNI: &str = "consumer-masque.cloudflareclient.com";
 
 /// How long the generated self-signed device certificate stays valid. The edge
 /// only reads its public key, so this is a formality.
@@ -143,7 +143,10 @@ fn pin_endpoint_key(
 
 /// A minimal self-signed certificate over the device key. Only the public key
 /// matters to the edge; every other field is filler.
-fn self_signed(device: &PKey<Private>) -> anyhow::Result<X509> {
+///
+/// Shared with the HTTP/3 carrier: the same device identity has to be offered
+/// on the QUIC handshake as on the TCP one.
+pub(super) fn self_signed(device: &PKey<Private>) -> anyhow::Result<X509> {
     let mut name = X509NameBuilder::new()?;
     name.append_entry_by_text("CN", "honk-masque")?;
     let name = name.build();
@@ -164,7 +167,7 @@ fn self_signed(device: &PKey<Private>) -> anyhow::Result<X509> {
 }
 
 /// Decode base64 key material, tolerating PEM armour and whitespace.
-fn decode_base64(value: &str, field: &str) -> anyhow::Result<Vec<u8>> {
+pub(super) fn decode_base64(value: &str, field: &str) -> anyhow::Result<Vec<u8>> {
     let mut flattened = String::with_capacity(value.len());
     for line in value.lines() {
         let line = line.trim();

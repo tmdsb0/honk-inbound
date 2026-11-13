@@ -232,10 +232,26 @@ pub struct MasqueConfig {
 }
 
 impl MasqueConfig {
-    /// Carrier the node dials over. Matches mihomo: an absent `network` means
-    /// HTTP/3, so both the dial path and node identity agree on one answer.
-    pub fn network(&self) -> &str {
-        self.network.as_deref().unwrap_or("quic")
+    /// Carrier the node dials over, normalised to either `h2` or `quic`.
+    ///
+    /// An absent `network` means HTTP/2: that is the carrier honk has always
+    /// dialled, and a node written without a carrier must keep working after
+    /// the QUIC carrier was added. Subscriptions and share links spell the
+    /// QUIC carrier as `quic`, `h3` or `http3`; all three are accepted and
+    /// collapsed here so the dial path and the node fingerprint agree on one
+    /// answer regardless of where the node came from. An unknown value falls
+    /// back to the default rather than making the whole node unusable, which
+    /// is what `share_link::apply_masque` already does.
+    pub fn network(&self) -> &'static str {
+        let value = self.network.as_deref().unwrap_or("").trim();
+        if value.eq_ignore_ascii_case("quic")
+            || value.eq_ignore_ascii_case("h3")
+            || value.eq_ignore_ascii_case("http3")
+        {
+            "quic"
+        } else {
+            "h2"
+        }
     }
 }
 
@@ -488,4 +504,51 @@ fn identity_join(fields: &[&str]) -> String {
         identity.push_str(&identity_field(field));
     }
     identity
+}
+
+#[cfg(test)]
+mod masque_network_tests {
+    use super::MasqueConfig;
+
+    fn with_network(network: Option<&str>) -> MasqueConfig {
+        MasqueConfig {
+            network: network.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn absent_network_defaults_to_h2() {
+        assert_eq!(with_network(None).network(), "h2");
+        assert_eq!(with_network(Some("")).network(), "h2");
+    }
+
+    #[test]
+    fn every_quic_spelling_normalises_to_quic() {
+        for spelling in ["quic", "h3", "http3", "QUIC", "H3", " quic "] {
+            assert_eq!(with_network(Some(spelling)).network(), "quic", "{spelling}");
+        }
+    }
+
+    #[test]
+    fn every_h2_spelling_normalises_to_h2() {
+        for spelling in ["h2", "http2", "H2", "unknown"] {
+            assert_eq!(with_network(Some(spelling)).network(), "h2", "{spelling}");
+        }
+    }
+
+    #[test]
+    fn fingerprint_is_stable_across_quic_spellings() {
+        use super::OutboundConfig;
+        let fingerprints: Vec<String> = ["quic", "h3", "http3"]
+            .iter()
+            .map(|spelling| {
+                OutboundConfig::Masque(with_network(Some(spelling))).dial_shape_fingerprint()
+            })
+            .collect();
+        assert!(
+            fingerprints.windows(2).all(|pair| pair[0] == pair[1]),
+            "one carrier must have one identity: {fingerprints:?}"
+        );
+    }
 }

@@ -1,22 +1,17 @@
 //! Carrier setup: how a MASQUE node's IP tunnel reaches its endpoint.
 //!
 //! `network: h2`    -> TCP + WARP TLS + HTTP/2 CONNECT-IP.
-//! `network: quic`  -> HTTP/3, which this carrier does not carry yet.
-//!                     MASQUE over H3 needs extended CONNECT with
-//!                     `:protocol = connect-ip`, and the pinned `h3` 0.0.8
-//!                     refuses that value at the HEADERS layer (upstream added
-//!                     it later), so opening it would mean vendoring a patched
-//!                     `h3`. It also needs QUIC DATAGRAM framing, whose layout
-//!                     differs from the HTTP/2 capsule this carrier already
-//!                     gets right — a second chance to get the wire format
-//!                     wrong. Reported instead of silently dialling a plain
-//!                     HTTP/3 stream.
+//! `network: quic`  -> QUIC + WARP TLS + HTTP/3 CONNECT-IP. WARP's H3 shape
+//!                     is not RFC 9484: it uses `:protocol = cf-connect-ip`
+//!                     and QUIC DATAGRAMs rather than DATAGRAM capsules. See
+//!                     [`super::http3`].
 
 use honk_config::node::Node;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
-use super::http2::MasqueTunnel;
+use super::http3;
+use super::tunnel::MasqueTunnel;
 use super::warp::WarpIdentity;
 use crate::proxy::AsyncReadWrite;
 use crate::proxy::detour::DetourPath;
@@ -39,16 +34,62 @@ pub async fn open_tunnel(
     let config = node
         .masque()
         .ok_or_else(|| anyhow::anyhow!("masque node {} has no masque config", node.name))?;
-    let network = config.network();
-    match network {
-        "h2" | "http2" | "" => open_h2(node, connect_timeout, detour, slot).await,
-        "quic" | "h3" | "http3" => anyhow::bail!(
-            "masque node {}: `network: quic` needs HTTP/3 connect-ip, which honk does not \
-             carry yet; use `network: h2`",
-            node.name
-        ),
+    // `MasqueConfig::network()` has already collapsed `h3`/`http3`/`quic`
+    // into one value and defaults an absent setting to `h2`.
+    match config.network() {
+        "h2" => open_h2(node, connect_timeout, detour, slot).await,
+        "quic" => open_quic(node, connect_timeout, detour, slot).await,
         other => anyhow::bail!("masque node {}: unsupported network {other:?}", node.name),
     }
+}
+
+/// QUIC + WARP TLS + HTTP/3 CONNECT-IP.
+///
+/// A detour supplies a TCP stream, but QUIC needs a UDP socket, so a detoured
+/// h3 node cannot reuse the h2 detour path. Reject it explicitly rather than
+/// silently dialling direct and bypassing the front node.
+async fn open_quic(
+    node: &Node,
+    connect_timeout: Duration,
+    detour: Option<&DetourPath>,
+    slot: usize,
+) -> anyhow::Result<MasqueTunnel> {
+    if detour.is_some() {
+        anyhow::bail!(
+            "masque node {}: `network: quic` does not support a detour yet; \
+             use `network: h2` for detoured MASQUE nodes",
+            node.name
+        );
+    }
+    if let Some(name) = node.detour_name() {
+        anyhow::bail!(
+            "masque node {}: `network: quic` does not support detour {name:?} yet; \
+             use `network: h2` for detoured MASQUE nodes",
+            node.name
+        );
+    }
+    let config = node
+        .masque()
+        .ok_or_else(|| anyhow::anyhow!("masque node {} has no masque config", node.name))?;
+    let address = endpoint_address(node);
+    let endpoint = resolve_endpoint(&address).await?;
+    let mtu = config.mtu.map(u32::from).unwrap_or(DEFAULT_MTU);
+    let tun_name = tun_name(node, slot);
+    let preferred = tunnel_addresses(node);
+    tracing::debug!(
+        "masque: opening connect-ip tunnel to {address} via h3 on {tun_name} \
+         (mtu {mtu}, addresses {preferred:?})"
+    );
+    http3::open_h3(
+        node,
+        endpoint,
+        connect_timeout,
+        mtu,
+        &tun_name,
+        &preferred,
+        slot,
+    )
+    .await
 }
 
 /// TCP + WARP TLS + HTTP/2 CONNECT-IP.

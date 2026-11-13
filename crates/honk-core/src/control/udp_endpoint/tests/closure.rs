@@ -175,15 +175,16 @@ async fn udp_close_waits_for_driver_and_exact_backend_ack() {
                 assert_eq!(pending.await, CloseOutcome::Failed);
                 assert_eq!(duplicate.await, CloseOutcome::Failed);
                 assert!(bulk.await.unwrap().failed);
-                assert_eq!(tracker.close_id(&id).await, CloseOutcome::Failed);
+                assert_eq!(tracker.close_id(&id).await, CloseOutcome::Gone);
                 assert!(failures.recv().await.is_some());
-                assert!(matches!(
+                // A failed retirement still reclaims its tombstone: leaving
+                // one behind would fence this tuple for the process lifetime.
+                assert!(
                     pool.endpoints
                         .get(&EndpointKey::new(source, destination))
-                        .unwrap()
-                        .value(),
-                    EndpointEntry::Retiring { .. }
-                ));
+                        .is_none(),
+                    "failed retirement must reclaim its tombstone"
+                );
                 assert_eq!(
                     backend
                         .read()
@@ -275,10 +276,14 @@ async fn udp_close_without_exact_pool_owner_completes_all_claims() {
             assert_eq!(first.wait().await, CloseOutcome::Failed);
             assert_eq!(
                 tracker.close_id("missing-owner").await,
-                CloseOutcome::Failed
+                CloseOutcome::Gone
             );
+            // The failed row was already reclaimed at `start_close`, so a
+            // later bulk sweep has nothing left to retire. The failure itself
+            // is still observable through `first.wait()` above and the owner's
+            // CloseSignal below.
             assert!(
-                tracker
+                !tracker
                     .close_matching(None, None, 1000)
                     .await
                     .unwrap()
@@ -287,7 +292,7 @@ async fn udp_close_without_exact_pool_owner_completes_all_claims() {
             signal.finish(true);
             assert_eq!(
                 tracker.close_id("missing-owner").await,
-                CloseOutcome::Failed
+                CloseOutcome::Gone
             );
             let replacement = CloseSignal::new();
             tracker.register_owned(

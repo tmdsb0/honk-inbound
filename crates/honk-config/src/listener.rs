@@ -259,8 +259,16 @@ mod tests {
 
     #[test]
     fn wildcard_and_loopback_same_port_conflict() {
+        // A wildcard listener must be authenticated before validation even
+        // reaches the port check; an unauthenticated one is rejected earlier
+        // as an open proxy, which would make this test assert the wrong error.
+        let mut wildcard = listener("a", 7890, "0.0.0.0".parse().unwrap());
+        wildcard.auth = Some(ListenerAuth {
+            username: "u".to_owned(),
+            password: "p".to_owned(),
+        });
         let items = vec![
-            listener("a", 7890, "0.0.0.0".parse().unwrap()),
+            wildcard,
             listener("b", 7890, "127.0.0.1".parse().unwrap()),
         ];
         assert!(
@@ -299,7 +307,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn udp_host_accepts_ip_and_domain() {
         assert_eq!(
             ListenerConfig::parse_udp_host("117.174.205.95").unwrap(),
@@ -327,6 +334,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn auth_requires_colon() {
         assert!(ListenerConfig::parse_auth("user").is_err());
         assert_eq!(

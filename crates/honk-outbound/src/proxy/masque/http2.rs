@@ -24,6 +24,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::watch;
 
 use super::tun::TunDevice;
+use super::tunnel::{LivenessGuard, MasqueTunnel};
 
 /// Authority of the CONNECT-IP request. Cloudflare's endpoints answer on their
 /// Access host regardless of which edge handled the TLS connection.
@@ -36,48 +37,6 @@ const CAPSULE_PROTOCOL_HEADER: (&str, &str) = ("capsule-protocol", "?1");
 /// rather than a request/response exchange, so the 64 KiB HTTP/2 default
 /// would stall it every few dozen packets.
 const WINDOW_SIZE: u32 = 1024 * 1024;
-
-/// Clears a tunnel's liveness flag when the task owning it exits, whichever
-/// way it exits.
-struct LivenessGuard(Arc<AtomicBool>);
-
-impl LivenessGuard {
-    fn new(flag: Arc<AtomicBool>) -> Self {
-        Self(flag)
-    }
-}
-
-impl Drop for LivenessGuard {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::Relaxed);
-    }
-}
-
-/// An established IP tunnel: a TUN device fed by a MASQUE carrier.
-pub struct MasqueTunnel {
-    tun: Arc<TunDevice>,
-    /// Source addresses the kernel may use: as many of IPv4 and IPv6 as the
-    /// endpoint (or the configuration) gave us.
-    addresses: Vec<IpAddr>,
-    /// Cleared by whichever direction notices the carrier is gone, so the
-    /// runtime can rebuild the tunnel instead of handing out a dead one.
-    alive: Arc<AtomicBool>,
-    /// Releases the shuttle tasks. Both of them wait on the carrier or on the
-    /// TUN device, and neither would notice on its own that the tunnel is
-    /// over: a device whose reader never returns keeps its name, and the next
-    /// tunnel for the same node then fails to create it with `EBUSY`.
-    ///
-    /// A watch rather than a `Notify`: waking only the waiters loses the
-    /// wakeup for whichever task was mid-packet at that moment, and that
-    /// task then holds its TUN device forever.
-    shutdown: watch::Sender<bool>,
-}
-
-impl Drop for MasqueTunnel {
-    fn drop(&mut self) {
-        let _ = self.shutdown.send(true);
-    }
-}
 
 impl MasqueTunnel {
     /// Perform the CONNECT, set the tunnel addresses up, and start shuttling
@@ -281,34 +240,7 @@ impl MasqueTunnel {
             let _ = downstream_shutdown.send(true);
         });
 
-        Ok(Self {
-            tun,
-            addresses,
-            alive,
-            shutdown,
-        })
-    }
-
-    /// Whether the carrier is still running. A tunnel whose carrier died is
-    /// unusable: the runtime replaces it rather than dialling through a TUN
-    /// device that no longer forwards packets.
-    pub fn is_alive(&self) -> bool {
-        self.alive.load(Ordering::Relaxed)
-    }
-
-    /// Interface name of the TUN device backing this tunnel.
-    pub fn tun_name(&self) -> &str {
-        self.tun.name()
-    }
-
-    /// Source address of the same family as `target`, which dialled sockets
-    /// must bind: the endpoint routes by source, so a mismatched family is a
-    /// dead flow.
-    pub fn source_for(&self, target: std::net::SocketAddr) -> Option<IpAddr> {
-        self.addresses
-            .iter()
-            .copied()
-            .find(|address| address.is_ipv4() == target.is_ipv4())
+        Ok(MasqueTunnel::new(tun, addresses, alive, shutdown))
     }
 }
 

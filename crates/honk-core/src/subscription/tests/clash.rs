@@ -919,13 +919,16 @@ fn websocket_headers_may_be_empty_and_sni_is_optional() {
 fn masque_carriers_keep_separate_node_identities() {
     // A subscription may list the same endpoint twice, once per carrier. The
     // carrier changes which server answers, so the two entries are distinct
-    // nodes rather than a duplicate to be dropped.
+    // nodes rather than a duplicate to be dropped. Both carriers are named
+    // explicitly: an absent `network` now means h2, so relying on the default
+    // would make these two nodes identical.
     const FEED: &str = r#"proxies:
   - name: warp-h3
     type: masque
     server: 151.242.164.2
     port: 65534
     private-key: MHcCAQEEIN/pynzk3UL6zTCxHM+H/kY5WJNbtFEpA3Hn/cjRtILPoAoGCCqGSM49AwEHoUQDQgAEZLr6964x5FHpnzlmskl+FLsbu66UYt71UYYqjjkTIqszZFonW4yTPFGwo6aNMkP5Psj66m/3a3i2yGe94h8CKQ==
+    network: quic
   - name: warp-h2
     type: masque
     server: 151.242.164.2
@@ -942,4 +945,50 @@ fn masque_carriers_keep_separate_node_identities() {
         ["warp-h3", "warp-h2"]
     );
     assert_ne!(nodes[0].derive_id(), nodes[1].derive_id());
+}
+
+#[test]
+fn masque_network_spellings_resolve_to_the_expected_carrier() {
+    // Subscriptions in the wild spell the QUIC carrier `quic`, `h3` or
+    // `http3`, and omit `network` entirely for HTTP/2. All of them must land
+    // on one of the two carriers honk actually dials — an absent setting in
+    // particular must not turn into a node that fails at startup.
+    const FEED: &str = r#"proxies:
+  - {name: absent-defaults-h2, type: masque, server: 43.129.179.241, port: 8443, ip: 100.96.0.6/32}
+  - {name: explicit-h2, type: masque, server: 13.250.41.68, port: 443, ip: 172.16.0.2, network: h2}
+  - {name: quic-spelling, type: masque, server: 162.159.198.2, port: 443, ip: 172.16.0.2/32, network: quic}
+  - {name: h3-spelling, type: masque, server: 162.159.199.2, port: 443, ip: 172.16.0.2/32, network: h3}
+  - {name: http3-spelling, type: masque, server: 162.159.198.2, port: 443, ip: 172.16.0.2/32, network: http3}
+"#;
+    let nodes = parse_clash_subscription(FEED, None).unwrap();
+    let carriers: Vec<(&str, &str)> = nodes
+        .iter()
+        .map(|node| (node.name.as_str(), node.masque().unwrap().network()))
+        .collect();
+    assert_eq!(
+        carriers,
+        [
+            ("absent-defaults-h2", "h2"),
+            ("explicit-h2", "h2"),
+            ("quic-spelling", "quic"),
+            ("h3-spelling", "quic"),
+            ("http3-spelling", "quic"),
+        ]
+    );
+    // `quic`, `h3` and `http3` are spellings of one carrier. Hold everything
+    // else equal and confirm the dial shape does not fork into three variants.
+    let shape = |raw: &str| {
+        let node = parse_clash_subscription(raw, None).unwrap().remove(0);
+        node.derive_id()
+    };
+    let template = |network: &str| {
+        format!(
+            "proxies:\n  - {{name: n, type: masque, server: 162.159.198.2, \
+             port: 443, ip: 172.16.0.2/32, network: {network}}}\n"
+        )
+    };
+    let quic = shape(&template("quic"));
+    assert_eq!(quic, shape(&template("h3")));
+    assert_eq!(quic, shape(&template("http3")));
+    assert_ne!(quic, shape(&template("h2")));
 }

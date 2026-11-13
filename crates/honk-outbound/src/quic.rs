@@ -382,6 +382,11 @@ pub async fn client_config(
             chrome: crate::tls::chrome_mode(),
             ech_config_list: ech,
             pin_sha256,
+            // WARP MASQUE supplies these directly through `http3.rs`; the
+            // generic QUIC dial path has no device identity to offer.
+            client_certificate: None,
+            client_private_key: None,
+            endpoint_public_key: None,
             ticket_key: Some(format!(
                 "{}|{}|{}|{}",
                 node.host(),

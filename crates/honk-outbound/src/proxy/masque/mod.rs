@@ -20,7 +20,9 @@ pub mod bind;
 pub mod capsule;
 pub mod carrier;
 pub mod http2;
+pub mod http3;
 pub mod tun;
+pub mod tunnel;
 pub mod warp;
 
 use async_trait::async_trait;
@@ -85,7 +87,7 @@ pub struct MasqueRuntime {
 /// while a live tunnel still answers to them.
 struct TunnelSlot {
     slot: usize,
-    tunnel: Arc<http2::MasqueTunnel>,
+    tunnel: Arc<tunnel::MasqueTunnel>,
     /// The front node the carrier was opened over. A group can switch its
     /// member while the tunnel is still alive; the cache must then rebuild
     /// instead of handing every new flow the old front's connection.
@@ -124,7 +126,7 @@ impl MasqueRuntime {
         &self,
         runtime: &NodeRuntime,
         connect_timeout: Duration,
-    ) -> anyhow::Result<Arc<http2::MasqueTunnel>> {
+    ) -> anyhow::Result<Arc<tunnel::MasqueTunnel>> {
         let detour = runtime.detour();
         self.tunnel_for(runtime, connect_timeout, detour.as_deref())
             .await
@@ -140,7 +142,7 @@ impl MasqueRuntime {
         runtime: &NodeRuntime,
         connect_timeout: Duration,
         detour: Option<&crate::proxy::detour::DetourPath>,
-    ) -> anyhow::Result<Arc<http2::MasqueTunnel>> {
+    ) -> anyhow::Result<Arc<tunnel::MasqueTunnel>> {
         let key = detour.map(|path| path.key());
         let carrier = detour.and_then(|path| path.carrier_id());
         let mut guard = self.tunnels.lock().await;

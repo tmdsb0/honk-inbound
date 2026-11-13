@@ -185,3 +185,9 @@ boring-sys = { git = "https://github.com/Glassyiris/boring-sys", rev = "3beb573b
 # let a controller pace by rate, and provide BBRv3 (Glassyiris/quinn#12).
 quinn = { git = "https://github.com/Glassyiris/quinn", rev = "11f1de84c28305a3c98ace6d681c35219a8d1e6c" }
 quinn-proto = { git = "https://github.com/Glassyiris/quinn", rev = "11f1de84c28305a3c98ace6d681c35219a8d1e6c" }
+# h3 0.0.8 vendor: its `Protocol` enum only knows `webtransport` and
+# `connect-udp`, but WARP's HTTP/3 MASQUE endpoint answers 400 unless the
+# extended CONNECT uses the private `:protocol = cf-connect-ip`. The crate's
+# tuple field is private, so the value has to be added in-tree. Upstream h3
+# 0.0.8 + one constant and one FromStr arm; nothing else was changed.
+h3 = { path = "vendor/h3" }

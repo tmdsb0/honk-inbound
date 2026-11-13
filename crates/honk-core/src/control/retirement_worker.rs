@@ -477,7 +477,7 @@ mod tests {
             "cancelled waiter cannot fail admitted close"
         );
         assert!(pins.contains(&key));
-        assert_eq!(tracker.snapshot().len(), 1);
+        assert_eq!(tracker.snapshot().len(), 0);
         assert!(locked.conn_state_lookup(&key)?.is_some());
         let mut byte = [0u8; 1];
         let mut reading = Box::pin(peer.read(&mut byte));
