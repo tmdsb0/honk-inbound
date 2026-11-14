@@ -10,6 +10,7 @@ use honk_config::node::Node;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
+use super::device::TunnelBackend;
 use super::http3;
 use super::tunnel::MasqueTunnel;
 use super::warp::WarpIdentity;
@@ -30,6 +31,7 @@ pub async fn open_tunnel(
     connect_timeout: Duration,
     detour: Option<&DetourPath>,
     slot: usize,
+    backend: TunnelBackend,
 ) -> anyhow::Result<MasqueTunnel> {
     let config = node
         .masque()
@@ -37,8 +39,8 @@ pub async fn open_tunnel(
     // `MasqueConfig::network()` has already collapsed `h3`/`http3`/`quic`
     // into one value and defaults an absent setting to `h2`.
     match config.network() {
-        "h2" => open_h2(node, connect_timeout, detour, slot).await,
-        "quic" => open_quic(node, connect_timeout, detour, slot).await,
+        "h2" => open_h2(node, connect_timeout, detour, slot, backend).await,
+        "quic" => open_quic(node, connect_timeout, detour, slot, backend).await,
         other => anyhow::bail!("masque node {}: unsupported network {other:?}", node.name),
     }
 }
@@ -53,6 +55,7 @@ async fn open_quic(
     connect_timeout: Duration,
     detour: Option<&DetourPath>,
     slot: usize,
+    backend: TunnelBackend,
 ) -> anyhow::Result<MasqueTunnel> {
     if detour.is_some() {
         anyhow::bail!(
@@ -88,6 +91,7 @@ async fn open_quic(
         &tun_name,
         &preferred,
         slot,
+        backend,
     )
     .await
 }
@@ -98,6 +102,7 @@ async fn open_h2(
     connect_timeout: Duration,
     detour: Option<&DetourPath>,
     slot: usize,
+    backend: TunnelBackend,
 ) -> anyhow::Result<MasqueTunnel> {
     let config = node
         .masque()
@@ -144,7 +149,7 @@ async fn open_h2(
         "masque: opening connect-ip tunnel to {address} via h2 on {tun_name} \
          (mtu {mtu}, addresses {preferred:?})"
     );
-    MasqueTunnel::open_h2(io, mtu, &tun_name, &preferred, slot).await
+    MasqueTunnel::open_h2(io, mtu, &tun_name, &preferred, slot, backend).await
 }
 
 /// Resolve the endpoint literal to an address a detour can dial.

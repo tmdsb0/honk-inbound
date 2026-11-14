@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::watch;
 
-use super::tun::TunDevice;
+use super::device::{TunnelBackend, TunnelDevice};
 use super::tunnel::{LivenessGuard, MasqueTunnel};
 
 /// Authority of the CONNECT-IP request. Cloudflare's endpoints answer on their
@@ -50,6 +50,7 @@ impl MasqueTunnel {
         tun_name: &str,
         preferred: &[IpAddr],
         slot: usize,
+        backend: TunnelBackend,
     ) -> anyhow::Result<Self>
     where
         IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -124,13 +125,12 @@ impl MasqueTunnel {
             anyhow::bail!("masque endpoint assigned no address and the node configures none");
         }
 
-        let tun = Arc::new(TunDevice::create(tun_name)?);
-        tun.configure(&addresses, mtu, slot)?;
+        let device = TunnelDevice::create(backend, tun_name, &addresses, mtu, slot)?;
 
         // TUN -> endpoint. Waiting on the device alone is not enough: a quiet
         // tunnel never wakes the reader, so the task also waits to be told the
         // carrier is gone.
-        let upstream = tun.clone();
+        let upstream = device.clone();
         let upstream_alive = LivenessGuard::new(Arc::clone(&alive));
         let upstream_shutdown = shutdown.clone();
         let mut upstream_signal = shutdown_signal.clone();
@@ -143,7 +143,7 @@ impl MasqueTunnel {
                 // The read borrows the buffer, so it has to end before the
                 // buffer is read back out: hence the block.
                 let outcome = {
-                    let read = upstream.recv(&mut packet);
+                    let read = upstream.recv_packet(&mut packet);
                     tokio::pin!(read);
                     tokio::select! {
                         result = &mut read => result,
@@ -164,7 +164,7 @@ impl MasqueTunnel {
                         }
                     }
                     Err(error) => {
-                        tracing::debug!("masque TUN read failed: {error}");
+                        tracing::debug!("masque packet device read failed: {error}");
                         break;
                     }
                 }
@@ -173,7 +173,7 @@ impl MasqueTunnel {
         });
 
         // Endpoint -> TUN.
-        let downstream = tun.clone();
+        let downstream = device.clone();
         let downstream_alive = LivenessGuard::new(Arc::clone(&alive));
         let downstream_shutdown = shutdown.clone();
         let mut downstream_signal = shutdown_signal.clone();
@@ -221,8 +221,8 @@ impl MasqueTunnel {
                                     payload.len()
                                 );
                             }
-                            if let Err(error) = downstream.send(&payload).await {
-                                tracing::debug!("masque TUN write failed: {error}");
+                            if let Err(error) = downstream.send_packet(&payload).await {
+                                tracing::debug!("masque packet device write failed: {error}");
                                 let _ = downstream_shutdown.send(true);
                                 return;
                             }
@@ -240,7 +240,7 @@ impl MasqueTunnel {
             let _ = downstream_shutdown.send(true);
         });
 
-        Ok(MasqueTunnel::new(tun, addresses, alive, shutdown))
+        Ok(MasqueTunnel::new(device, addresses, alive, shutdown))
     }
 }
 

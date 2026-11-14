@@ -10,20 +10,38 @@
 //! * IP packets travel inside DATAGRAM capsules (HTTP/2) or QUIC DATAGRAMs
 //!   (HTTP/3).
 //!
-//! Rather than reimplementing TCP in userspace, honk exposes the tunnel as a
-//! TUN device and lets the **kernel** own TCP and UDP. A dialled socket is
-//! bound to the TUN device (`SO_BINDTODEVICE`) and to the assigned source
-//! address, so the kernel routes it through the tunnel with full BBR, window
-//! scaling and retransmit behaviour. See [`tun`] and [`bind`].
+//! Two backends carry those packets, chosen once at boot by
+//! `global.masque_tunnel_mode`:
+//!
+//! * `tun` (default) exposes the tunnel as a kernel TUN device and lets the
+//!   kernel own TCP/UDP. A dialled socket is bound to the device
+//!   (`SO_BINDTODEVICE`) and to the assigned source address, so the kernel
+//!   routes it with full BBR, window scaling and retransmit behaviour. See
+//!   [`tun`] and [`bind`].
+//! * `userspace` hands packets to an in-process smoltcp stack that owns
+//!   TCP/UDP itself — no TUN device, no `ip` calls, no extra capabilities.
+//!   See [`userspace`].
+//!
+//! Carriers, shuttles and dial paths are written against
+//! [`device::TunnelDevice`] and never branch on the backend, so the default
+//! kernel path is unchanged.
 
 pub mod bind;
 pub mod capsule;
 pub mod carrier;
+pub mod device;
 pub mod http2;
 pub mod http3;
 pub mod tun;
 pub mod tunnel;
+pub mod userspace;
 pub mod warp;
+
+/// Set the MASQUE tunnel backend chosen from `global.masque_tunnel_mode`.
+///
+/// Re-exported so the boot path can record the setting once, before any
+/// tunnel opens; the value is then read on every tunnel open.
+pub use device::{set_masque_tunnel_backend, TunnelBackend};
 
 use async_trait::async_trait;
 use honk_config::node::Node;
@@ -49,7 +67,7 @@ static NEXT_EPHEMERAL_MASQUE_SLOT: AtomicUsize = AtomicUsize::new(EPHEMERAL_MASQ
 
 use super::{
     PacketOutbound, PacketTransport, ProbeableOutbound, ProxyStream, RuntimeOwnedIo, TcpOutbound,
-    UdpSocketTransport, WarmRequirement, WarmableOutbound,
+    WarmRequirement, WarmableOutbound,
 };
 use crate::runtime::{NodeRuntime, ProtocolRuntime};
 
@@ -176,7 +194,14 @@ impl MasqueRuntime {
                 .unwrap_or(guard.len())
         };
         let tunnel = Arc::new(
-            carrier::open_tunnel(runtime.node.as_ref(), connect_timeout, detour, slot).await?,
+            carrier::open_tunnel(
+                runtime.node.as_ref(),
+                connect_timeout,
+                detour,
+                slot,
+                device::masque_tunnel_backend(),
+            )
+            .await?,
         );
         guard.insert(
             key,
@@ -260,8 +285,10 @@ impl TcpOutbound for MasqueHandler {
         )
     }
 
-    /// Kernel TCP through the tunnel: bind the socket to the TUN device and to
-    /// the address the endpoint assigned, then connect normally.
+    /// TCP through the tunnel: the backend decides how. The kernel backend
+    /// binds a real socket to the TUN device; the userspace backend opens the
+    /// connection inside smoltcp. Both return the same stream, so this stays
+    /// backend-agnostic.
     async fn dial_runtime(
         &self,
         runtime: Arc<NodeRuntime>,
@@ -271,28 +298,20 @@ impl TcpOutbound for MasqueHandler {
     ) -> anyhow::Result<ProxyStream> {
         let masque = masque_runtime(runtime.as_ref())?;
         let tunnel = masque.tunnel(runtime.as_ref(), connect_timeout).await?;
-        let source = tunnel.source_for(target).ok_or_else(|| {
+        let stream = tunnel.dial(target, connect_timeout).await.map_err(|error| {
             anyhow::anyhow!(
-                "masque node {} has no {} source address for {target}",
+                "masque node {} cannot reach {target} through {}: {error}",
                 runtime.node.name,
-                if target.is_ipv4() { "IPv4" } else { "IPv6" },
+                tunnel.label()
             )
         })?;
-        let stream = bind::connect_via_tun(tunnel.tun_name(), source, target, connect_timeout)
-            .await
-            .map_err(|error| {
-                anyhow::anyhow!(
-                    "masque node {} cannot reach {target} through {}: {error}",
-                    runtime.node.name,
-                    tunnel.tun_name()
-                )
-            })?;
         crate::runtime::flow_observation::milestone(
             crate::runtime::flow_observation::Milestone::TransportReady,
         );
-        // The flow owns a reference to the tunnel: while its socket is bound
-        // to the TUN device, pruning must not pull the device out from under
-        // it. Once the flow ends, the map is the only owner again.
+        // The flow owns a reference to the tunnel: while its socket rides the
+        // tunnel (a bound kernel socket or a smoltcp flow), pruning must not
+        // pull the device out from under it. Once the flow ends, the map is
+        // the only owner again.
         Ok(ProxyStream {
             stream: Box::new(RuntimeOwnedIo::new(stream, Arc::clone(&tunnel))),
             target_addr: target,
@@ -319,28 +338,20 @@ impl TcpOutbound for MasqueHandler {
         let tunnel = masque
             .tunnel_for(runtime.as_ref(), connect_timeout, Some(detour.as_ref()))
             .await?;
-        let source = tunnel.source_for(target).ok_or_else(|| {
+        let stream = tunnel.dial(target, connect_timeout).await.map_err(|error| {
             anyhow::anyhow!(
-                "masque node {} has no {} source address for {target}",
+                "masque node {} cannot reach {target} through {}: {error}",
                 runtime.node.name,
-                if target.is_ipv4() { "IPv4" } else { "IPv6" },
+                tunnel.label()
             )
         })?;
-        let stream = bind::connect_via_tun(tunnel.tun_name(), source, target, connect_timeout)
-            .await
-            .map_err(|error| {
-                anyhow::anyhow!(
-                    "masque node {} cannot reach {target} through {}: {error}",
-                    runtime.node.name,
-                    tunnel.tun_name()
-                )
-            })?;
         crate::runtime::flow_observation::milestone(
             crate::runtime::flow_observation::Milestone::TransportReady,
         );
-        // The flow owns a reference to the tunnel: while its socket is bound
-        // to the TUN device, pruning must not pull the device out from under
-        // it. Once the flow ends, the map is the only owner again.
+        // The flow owns a reference to the tunnel: while its socket rides the
+        // tunnel (a bound kernel socket or a smoltcp flow), pruning must not
+        // pull the device out from under it. Once the flow ends, the map is
+        // the only owner again.
         Ok(ProxyStream {
             stream: Box::new(RuntimeOwnedIo::new(stream, Arc::clone(&tunnel))),
             target_addr: target,
@@ -370,18 +381,16 @@ impl MasqueHandler {
             }
             None => masque.tunnel(runtime.as_ref(), connect_timeout).await?,
         };
-        let source = tunnel.source_for(target).ok_or_else(|| {
-            anyhow::anyhow!(
-                "masque node {} has no {} source address for UDP {target}",
-                runtime.node.name,
-                if target.is_ipv4() { "IPv4" } else { "IPv6" },
-            )
-        })?;
-        let socket = bind::udp_via_tun(tunnel.tun_name(), source)?;
-        let socket = tokio::net::UdpSocket::from_std(socket)?;
-        socket.connect(target).await?;
-        let transport: Arc<dyn PacketTransport> =
-            Arc::new(UdpSocketTransport::new(Arc::new(socket), target));
+        let transport = tunnel
+            .dial_udp(target, connect_timeout)
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "masque node {} cannot reach UDP {target} through {}: {error}",
+                    runtime.node.name,
+                    tunnel.label()
+                )
+            })?;
         Ok(crate::proxy::packet_transport_with_owner(
             transport,
             Arc::clone(&tunnel),
@@ -433,7 +442,7 @@ impl PacketOutbound for MasqueHandler {
 #[async_trait]
 impl WarmableOutbound for MasqueHandler {
     /// Establish the tunnel ahead of the first flow. UDP needs nothing extra:
-    /// the kernel owns UDP exactly as it owns TCP once the interface exists.
+    /// whichever backend owns the packet device owns UDP too.
     async fn warm(
         &self,
         runtime: Arc<NodeRuntime>,

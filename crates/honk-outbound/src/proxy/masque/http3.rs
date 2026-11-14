@@ -36,7 +36,7 @@ use quinn::{ClientConfig, TransportConfig, VarInt};
 use crate::quic::boring::{BoringQuicClientConfig, BoringQuicOptions};
 
 use super::capsule::{put_varint, read_varint};
-use super::tun::TunDevice;
+use super::device::{TunnelBackend, TunnelDevice};
 use super::tunnel::{LivenessGuard, MasqueTunnel};
 use super::warp::{self, DEFAULT_SNI};
 
@@ -81,6 +81,7 @@ pub async fn open_h3(
     tun_name: &str,
     preferred: &[IpAddr],
     slot: usize,
+    backend: TunnelBackend,
 ) -> anyhow::Result<MasqueTunnel> {
     let config = node
         .masque()
@@ -158,11 +159,10 @@ pub async fn open_h3(
         );
     }
 
-    let tun = Arc::new(TunDevice::create(tun_name)?);
-    tun.configure(preferred, mtu, slot)?;
+    let device = TunnelDevice::create(backend, tun_name, preferred, mtu, slot)?;
 
     // TUN -> endpoint. Each IP packet becomes one QUIC DATAGRAM.
-    let upstream_tun = tun.clone();
+    let upstream_tun = device.clone();
     let upstream_conn = connection.clone();
     let upstream_alive = LivenessGuard::new(Arc::clone(&alive));
     let upstream_shutdown = shutdown.clone();
@@ -174,7 +174,7 @@ pub async fn open_h3(
         let mut packets = 0usize;
         loop {
             let outcome = {
-                let read = upstream_tun.recv(&mut packet);
+                let read = upstream_tun.recv_packet(&mut packet);
                 tokio::pin!(read);
                 tokio::select! {
                     result = &mut read => result,
@@ -197,7 +197,7 @@ pub async fn open_h3(
                     }
                 }
                 Err(error) => {
-                    tracing::debug!("masque TUN read failed: {error}");
+                    tracing::debug!("masque packet device read failed: {error}");
                     break;
                 }
             }
@@ -207,7 +207,7 @@ pub async fn open_h3(
 
     // Endpoint -> TUN. QUIC DATAGRAMs arrive whole, so unlike the HTTP/2
     // carrier there is no stream buffer and no flow control to release.
-    let downstream_tun = tun.clone();
+    let downstream_tun = device.clone();
     let downstream_conn = connection.clone();
     let downstream_alive = LivenessGuard::new(Arc::clone(&alive));
     let downstream_shutdown = shutdown.clone();
@@ -230,7 +230,7 @@ pub async fn open_h3(
                     break;
                 }
             };
-            let Some(packet) = decode_ip_datagram(&datagram) else {
+            let Some(packet) = decode_ip_datagram(datagram) else {
                 continue;
             };
             packets += 1;
@@ -240,8 +240,8 @@ pub async fn open_h3(
                     packet.len()
                 );
             }
-            if let Err(error) = downstream_tun.send(&packet).await {
-                tracing::debug!("masque TUN write failed: {error}");
+            if let Err(error) = downstream_tun.send_packet(&packet).await {
+                tracing::debug!("masque packet device write failed: {error}");
                 let _ = downstream_shutdown.send(true);
                 return;
             }
@@ -273,7 +273,7 @@ pub async fn open_h3(
     });
 
     Ok(MasqueTunnel::new(
-        tun,
+        device,
         preferred.to_vec(),
         alive,
         shutdown,
@@ -342,8 +342,8 @@ fn encode_ip_datagram(packet: &[u8]) -> Bytes {
 /// Unwrap one HTTP/3 DATAGRAM, checking both identifiers before handing the
 /// remaining bytes to the TUN device. Datagrams for another flow or context
 /// are dropped, not treated as IP packets.
-fn decode_ip_datagram(datagram: &[u8]) -> Option<Bytes> {
-    let mut cursor: &[u8] = datagram;
+fn decode_ip_datagram(datagram: Bytes) -> Option<Bytes> {
+    let mut cursor: &[u8] = &datagram;
     let flow_id = read_varint(&mut cursor)?;
     if flow_id != CONNECT_FLOW_ID {
         tracing::trace!("masque h3: dropping datagram for flow {flow_id}");
@@ -357,7 +357,11 @@ fn decode_ip_datagram(datagram: &[u8]) -> Option<Bytes> {
     if cursor.is_empty() {
         return None;
     }
-    Some(Bytes::copy_from_slice(cursor))
+    // quinn already hands us a refcounted buffer. Slice the two IDs off the
+    // front instead of copying the whole IP packet a second time on the
+    // downstream path of every datagram.
+    let header_len = datagram.len() - cursor.len();
+    Some(datagram.slice(header_len..))
 }
 
 #[cfg(test)]
@@ -370,7 +374,10 @@ mod tests {
         let encoded = encode_ip_datagram(&packet);
         // flow id 0, context id 0, then the packet verbatim.
         assert_eq!(&encoded[..2], b"\x00\x00");
-        assert_eq!(decode_ip_datagram(&encoded).unwrap().as_ref(), packet.as_slice());
+        assert_eq!(
+            decode_ip_datagram(encoded.clone()).unwrap().as_ref(),
+            packet.as_slice()
+        );
     }
 
     #[test]
@@ -388,20 +395,20 @@ mod tests {
         put_varint(&mut wrong_flow, 1);
         put_varint(&mut wrong_flow, 0);
         wrong_flow.extend_from_slice(b"\x45\x00");
-        assert!(decode_ip_datagram(&wrong_flow).is_none());
+        assert!(decode_ip_datagram(wrong_flow.freeze()).is_none());
 
         let mut wrong_context = BytesMut::new();
         put_varint(&mut wrong_context, 0);
         put_varint(&mut wrong_context, 7);
         wrong_context.extend_from_slice(b"\x45\x00");
-        assert!(decode_ip_datagram(&wrong_context).is_none());
+        assert!(decode_ip_datagram(wrong_context.freeze()).is_none());
     }
 
     #[test]
     fn truncated_datagrams_are_dropped() {
-        assert!(decode_ip_datagram(b"").is_none());
-        assert!(decode_ip_datagram(b"\x00").is_none());
-        assert!(decode_ip_datagram(b"\x00\x00").is_none());
+        assert!(decode_ip_datagram(Bytes::from_static(b"")).is_none());
+        assert!(decode_ip_datagram(Bytes::from_static(b"\x00")).is_none());
+        assert!(decode_ip_datagram(Bytes::from_static(b"\x00\x00")).is_none());
     }
 
     #[test]

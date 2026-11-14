@@ -13,8 +13,13 @@
 
 use std::io;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
+
+use crate::proxy::AsyncReadWrite;
+use crate::proxy::PacketTransport;
+use super::userspace::UserspaceDevice;
 
 /// Open a TCP connection whose packets leave through `tun` using `source` as
 /// the source address.
@@ -108,4 +113,55 @@ fn bind_tunnel(_socket: &socket2::Socket, _tun: &str, _source: IpAddr) -> io::Re
         io::ErrorKind::Unsupported,
         "MASQUE tunnels require SO_BINDTODEVICE, which is Linux-only",
     ))
+}
+
+/// Open a TCP connection through the in-process smoltcp stack backing the
+/// `userspace` tunnel backend. The kernel is never involved: smoltcp owns the
+/// connection and hands it back as a stream that behaves like any other.
+pub async fn connect_via_userspace(
+    device: &Arc<UserspaceDevice>,
+    source: IpAddr,
+    target: SocketAddr,
+    connect_timeout: Duration,
+) -> io::Result<Box<dyn AsyncReadWrite>> {
+    if source.is_ipv4() != target.is_ipv4() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "masque tunnel source and target address families differ",
+        ));
+    }
+    let connection = device.tcp_connect(source, target, connect_timeout).await.map_err(
+        |error| {
+            io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                format!("masque userspace connect to {target} failed: {error}"),
+            )
+        },
+    )?;
+    Ok(Box::new(connection) as Box<dyn AsyncReadWrite>)
+}
+
+/// Bind a UDP socket inside the in-process smoltcp stack backing the
+/// `userspace` tunnel backend.
+pub async fn udp_via_userspace(
+    device: &Arc<UserspaceDevice>,
+    source: IpAddr,
+    target: SocketAddr,
+    connect_timeout: Duration,
+) -> io::Result<Arc<dyn PacketTransport>> {
+    if source.is_ipv4() != target.is_ipv4() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "masque tunnel source and target address families differ",
+        ));
+    }
+    let socket = device.udp_bind(source, target, connect_timeout).await.map_err(
+        |error| {
+            io::Error::new(
+                io::ErrorKind::AddrInUse,
+                format!("masque userspace udp bind for {target} failed: {error}"),
+            )
+        },
+    )?;
+    Ok(Arc::new(socket) as Arc<dyn PacketTransport>)
 }

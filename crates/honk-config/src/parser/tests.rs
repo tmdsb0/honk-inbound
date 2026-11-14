@@ -45,6 +45,28 @@ global {
     }
 
     #[test]
+    fn masque_tunnel_mode_defaults_to_tun_and_parses_userspace() {
+        // The dae parser maps global keys by hand: a key missing from
+        // GLOBAL_KEYS is silently ignored, which would make the setting a
+        // no-op. This guards both the default and the parser wiring.
+        assert_eq!(
+            parse_dae_config("global {}")
+                .unwrap()
+                .global
+                .masque_tunnel_mode,
+            "tun"
+        );
+        let mut diagnostics = Vec::new();
+        let config = parse_dae_config_with_diagnostics(
+            "global { masque_tunnel_mode: userspace }",
+            &mut diagnostics,
+        )
+        .unwrap();
+        assert_eq!(config.global.masque_tunnel_mode, "userspace");
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
     fn shutdown_wait_connections_requires_a_boolean() {
         for (input, expected) in [
             ("global {}", false),

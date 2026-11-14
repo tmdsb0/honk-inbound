@@ -132,7 +132,17 @@ impl TunDevice {
             let mut guard = self.inner.writable().await?;
             match guard.try_io(|inner| {
                 let mut file = inner.get_ref();
-                file.write(packet)
+                let written = file.write(packet)?;
+                // A TUN write is normally atomic, but a short write would put
+                // a truncated IP packet on the wire. Fail loudly instead of
+                // silently corrupting the tunnel.
+                if written != packet.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "masque TUN write was truncated",
+                    ));
+                }
+                Ok(written)
             }) {
                 Ok(result) => return result,
                 Err(_would_block) => continue,
@@ -145,14 +155,16 @@ impl TunDevice {
 /// resolved (it expands a `%d` template to the next free index).
 fn attach(file: &File, name: &str) -> io::Result<String> {
     let mut request: libc::ifreq = unsafe { mem::zeroed() };
-    for (slot, byte) in request.ifr_name.iter_mut().zip(name.bytes()) {
-        *slot = byte as libc::c_char;
-    }
+    // Check before copying: `ifr_name` has to keep one byte for the NUL
+    // terminator, and writing a full-length name would leave none.
     if name.len() >= request.ifr_name.len() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("TUN name {name:?} exceeds IFNAMSIZ"),
         ));
+    }
+    for (slot, byte) in request.ifr_name.iter_mut().zip(name.bytes()) {
+        *slot = byte as libc::c_char;
     }
     request.ifr_ifru.ifru_flags = (libc::IFF_TUN | libc::IFF_NO_PI) as libc::c_short;
 
