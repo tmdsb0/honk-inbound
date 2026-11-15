@@ -382,8 +382,9 @@ use storage::{CacheValue, NegativeEntry};
 /// but remain available via [`DnsCache::get_stale`] for one hour
 /// (serve-stale, RFC 8767) before being dropped.
 ///
-/// Also maintains a negative cache for NXDOMAIN/SERVFAIL responses
-/// to avoid repeated upstream queries for known-bad domains.
+/// The negative slot is retained for inspection and compatibility; the
+/// forwarder no longer stores failed lookups there, so only resolutions
+/// that yielded at least one address are cached.
 ///
 /// When a [`DnsCachePersister`](super::persist::DnsCachePersister) is
 /// installed (`cache_file.store_dns`), every positive `put` is mirrored to
