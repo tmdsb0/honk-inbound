@@ -1021,8 +1021,12 @@ async fn udp_carrier_close_is_node_failure() {
         )
         .await
         .unwrap();
-    let endpoint =
-        crate::quic::packet_transport_endpoint(transport.clone(), transport.relay_addr()).unwrap();
+    let endpoint = crate::quic::packet_transport_endpoint_with_mtu(
+        transport.clone(),
+        transport.relay_addr(),
+        1252,
+    )
+    .unwrap();
     let (conn, _) = client.connection(timeout).await.unwrap();
     conn.close(quinn::VarInt::from_u32(0), b"carrier closed");
     let error = transport.send_packet(b"query").await.unwrap_err();

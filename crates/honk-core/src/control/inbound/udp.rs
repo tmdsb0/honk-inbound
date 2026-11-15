@@ -173,6 +173,7 @@ impl UdpRelay {
         }))
     }
 
+    #[cfg(test)]
     pub(super) fn local_addr(&self) -> SocketAddr {
         self.local_addr
     }

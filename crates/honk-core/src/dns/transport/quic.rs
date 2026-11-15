@@ -488,8 +488,12 @@ mod packet_cause_tests {
     async fn dns_quic_keeps_carrier_causes_through_candidate_failure() {
         let remote = "127.0.0.1:443".parse().unwrap();
         let endpoint = Arc::new(
-            honk_outbound::quic::packet_transport_endpoint(Arc::new(FailedCarrier(remote)), remote)
-                .unwrap(),
+            honk_outbound::quic::packet_transport_endpoint_with_mtu(
+                Arc::new(FailedCarrier(remote)),
+                remote,
+                1252,
+            )
+            .unwrap(),
         );
         let config = super::super::tests_proto::insecure_quic_config(b"doq").await;
         let connection_error = Arc::new(parking_lot::Mutex::new(None));

@@ -127,6 +127,7 @@ impl TransportQuinnSocket {
             let recv_waker = Arc::clone(&recv_waker);
             async move {
                 let mut first_datagram = true;
+                let mut tx_seq = 0u64;
                 while let Some(queued) = outbound_rx.recv().await {
                     if queued.enqueued_at.elapsed() >= TRANSPORT_PACKET_MAX_AGE {
                         if metrics_enabled {
@@ -136,6 +137,15 @@ impl TransportQuinnSocket {
                     }
                     let first = first_datagram;
                     let data = queued.data;
+                    tx_seq += 1;
+                    if tx_seq <= 24 {
+                        tracing::debug!(
+                            seq = tx_seq,
+                            bytes = data.len(),
+                            head = %format!("{:02x?}", &data[..data.len().min(12)]),
+                            "QUIC adapter tx datagram"
+                        );
+                    }
                     let timeout = transport.send_timeout().max(Duration::from_millis(1));
                     let attempt = QuicSendAttempt::new(transport.as_ref());
                     let result = tokio::time::timeout(timeout, async {
@@ -160,10 +170,21 @@ impl TransportQuinnSocket {
                     };
                     match result {
                         Ok(()) => {
+                            if first {
+                                tracing::info!(
+                                    bytes = data.len(),
+                                    "QUIC adapter sent first datagram through detour transport"
+                                );
+                            }
                             first_datagram = false;
                             attempt.success();
                         }
                         Err(error) => {
+                            tracing::warn!(
+                                seq = tx_seq,
+                                error = %error,
+                                "QUIC adapter tx datagram failed"
+                            );
                             if timed_out {
                                 attempt.timeout();
                             } else {
@@ -186,6 +207,7 @@ impl TransportQuinnSocket {
                         }
                     }
                 }
+                tracing::warn!(tx_datagrams = tx_seq, "QUIC adapter sender worker stopped");
             }
         };
         let allows_full_cone_replies = transport.allows_full_cone_replies();
@@ -195,6 +217,8 @@ impl TransportQuinnSocket {
             async move {
                 let mut buf = vec![0u8; 65536];
                 let mut since_yield = 0;
+                let mut first_datagram = true;
+                let mut rx_seq = 0u64;
                 loop {
                     if since_yield == RECV_YIELD_EVERY {
                         since_yield = 0;
@@ -203,6 +227,11 @@ impl TransportQuinnSocket {
                     let (n, source) = match transport.recv_packet(&mut buf).await {
                         Ok(packet) => packet,
                         Err(error) => {
+                            tracing::warn!(
+                                rx_datagrams = rx_seq,
+                                error = %error,
+                                "QUIC adapter receiver worker stopped"
+                            );
                             *recv_error.lock() = Some(TransportIoError::fatal(error));
                             wake_recv(&recv_waker);
                             return;
@@ -212,16 +241,60 @@ impl TransportQuinnSocket {
                     if n == 0 {
                         continue;
                     }
+                    if first_datagram {
+                        first_datagram = false;
+                        tracing::info!(
+                            bytes = n,
+                            %source,
+                            "QUIC adapter received first datagram from detour transport"
+                        );
+                    }
+                    rx_seq += 1;
+                    if rx_seq <= 24 {
+                        tracing::debug!(
+                            seq = rx_seq,
+                            bytes = n,
+                            %source,
+                            head = %format!("{:02x?}", &buf[..n.min(12)]),
+                            "QUIC adapter rx datagram"
+                        );
+                    }
                     if source != remote && !allows_full_cone_replies {
+                        // A front node's UDP relay may report a different source
+                        // address than the pinned peer. Silently dropping every
+                        // reply here looks exactly like a handshake timeout, so
+                        // log the first few (and then rate-limit).
+                        static FILTERED: std::sync::atomic::AtomicU64 =
+                            std::sync::atomic::AtomicU64::new(0);
+                        let filtered =
+                            FILTERED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        if filtered <= 3 || filtered % 1000 == 0 {
+                            tracing::warn!(
+                                source = %source,
+                                expected = %remote,
+                                dropped = filtered,
+                                "QUIC adapter dropped datagram from unexpected source"
+                            );
+                        }
                         continue;
                     }
                     if n > buf.len() {
-                        *recv_error.lock() = Some(TransportIoError::fatal(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "PacketTransport returned a datagram larger than its receive buffer",
-                        )));
-                        wake_recv(&recv_waker);
-                        return;
+                        // Mirror `poll_recv`: a real UDP socket drops one
+                        // oversized datagram and stays usable. Failing here
+                        // instead killed quinn's driver and surfaced as a
+                        // misleading `EndpointStopping`.
+                        static OVERSIZED_RX: std::sync::atomic::AtomicU64 =
+                            std::sync::atomic::AtomicU64::new(0);
+                        let dropped =
+                            OVERSIZED_RX.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        if dropped <= 3 {
+                            tracing::warn!(
+                                datagram_len = n,
+                                buffer_len = buf.len(),
+                                "QUIC adapter dropped oversized transport datagram"
+                            );
+                        }
+                        continue;
                     }
                     // A full queue drops the datagram (UDP semantics); the
                     // transport read must never backpressure or allocate for a drop.
@@ -230,6 +303,20 @@ impl TransportQuinnSocket {
                         Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                             if metrics_enabled {
                                 record_transport_rx_drop();
+                            }
+                            // Drops are invisible when metrics are disabled
+                            // (health probes, detoured endpoints), yet losing
+                            // an Initial/Handshake datagram stalls QUIC until
+                            // its deadline. Log the first few, then rate-limit.
+                            static DROPPED: std::sync::atomic::AtomicU64 =
+                                std::sync::atomic::AtomicU64::new(0);
+                            let dropped =
+                                DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                            if dropped <= 3 || dropped % 1000 == 0 {
+                                tracing::warn!(
+                                    dropped,
+                                    "QUIC adapter receive queue full: dropping datagram"
+                                );
                             }
                         }
                         Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
@@ -444,14 +531,27 @@ impl quinn::AsyncUdpSocket for TransportQuinnSocket {
         for (buf, meta_slot) in bufs.iter_mut().zip(meta.iter_mut()) {
             match inbound.poll_recv(cx) {
                 Poll::Ready(Some(data)) => {
-                    // The endpoint advertises a 1252-byte receive buffer. Never hand Quinn a
-                    // truncated packet: a partial QUIC packet is indistinguishable from wire
-                    // corruption. Fail the adapter so the caller can redial with a safe path.
+                    // A real UDP socket drops one oversized datagram and keeps
+                    // the socket usable. Returning an error here instead kills
+                    // quinn's endpoint driver, whose `EndpointStopping` hides
+                    // the real cause (and this error never reaches
+                    // `terminal_error`, so callers cannot report it either).
+                    // Never hand Quinn a truncated packet, but do not take the
+                    // whole connection down with it.
                     if data.len() > buf.len() {
-                        return Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "PacketTransport returned a datagram larger than the QUIC receive buffer",
-                        )));
+                        static OVERSIZED: std::sync::atomic::AtomicU64 =
+                            std::sync::atomic::AtomicU64::new(0);
+                        let dropped =
+                            OVERSIZED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        if dropped <= 3 || dropped % 1000 == 0 {
+                            tracing::warn!(
+                                datagram_len = data.len(),
+                                buffer_len = buf.len(),
+                                dropped,
+                                "QUIC adapter dropped oversized datagram from detour transport"
+                            );
+                        }
+                        continue;
                     }
                     let len = data.len();
                     buf[..len].copy_from_slice(&data);
@@ -462,16 +562,30 @@ impl quinn::AsyncUdpSocket for TransportQuinnSocket {
                         ecn: None,
                         dst_ip: None,
                     };
+                    static DELIVERED: std::sync::atomic::AtomicU64 =
+                        std::sync::atomic::AtomicU64::new(0);
+                    let delivered =
+                        DELIVERED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    if delivered <= 24 {
+                        tracing::debug!(
+                            seq = delivered,
+                            len,
+                            head = %format!("{:02x?}", &data[..data.len().min(12)]),
+                            "QUIC adapter delivered datagram to quinn"
+                        );
+                    }
                     count += 1;
                 }
                 Poll::Ready(None) => {
-                    return if count == 0 {
-                        Poll::Ready(Err(self
+                    if count == 0 {
+                        tracing::warn!(
+                            "QUIC adapter receive channel closed; quinn endpoint driver will stop"
+                        );
+                        return Poll::Ready(Err(self
                             .terminal_error()
-                            .unwrap_or_else(|| io::Error::from(io::ErrorKind::BrokenPipe))))
-                    } else {
-                        Poll::Ready(Ok(count))
-                    };
+                            .unwrap_or_else(|| io::Error::from(io::ErrorKind::BrokenPipe))));
+                    }
+                    return Poll::Ready(Ok(count));
                 }
                 Poll::Pending => {
                     if count != 0 {
@@ -553,14 +667,23 @@ impl PacketTransportEndpoint {
     }
 }
 
-/// Create a [`PacketTransportEndpoint`] pinned to `remote` with the safe
-/// 1252-byte UDP payload cap. Metrics are disabled because this constructor is
-/// also used by temporary health probes.
-pub fn packet_transport_endpoint(
+/// Create a packet-backed endpoint advertising `mtu` as its QUIC UDP payload
+/// cap instead of the conservative 1252-byte direct-socket default.
+///
+/// Every fronted QUIC path uses [`crate::quic::FRONTED_UDP_PAYLOAD_SIZE`]:
+/// Hysteria2 / TUIC / Juicity detour dials (via `QuicClient::detour_handshake`)
+/// and both direct and fronted MASQUE h3 tunnels. A MASQUE connect-ip tunnel
+/// sends one whole 1280-byte IP packet per QUIC DATAGRAM, which needs about
+/// 1350 bytes with QUIC/H3 overhead. A detour frames that datagram inside the
+/// front node's stream transport; TCP segments the stream, so the datagram is
+/// neither enlarged nor shrunk. `endpoint_config_with_mtu` clamps to quinn's
+/// legal range.
+pub fn packet_transport_endpoint_with_mtu(
     transport: Arc<dyn PacketTransport>,
     remote: SocketAddr,
+    mtu: u16,
 ) -> io::Result<PacketTransportEndpoint> {
-    packet_transport_endpoint_with_metrics(transport, remote, false, None)
+    build_packet_transport_endpoint(transport, remote, mtu, false, None)
 }
 
 /// Create a packet-backed endpoint whose adapter pressure counters belong to a
@@ -572,6 +695,16 @@ pub fn packet_transport_endpoint_with_metrics(
     metrics_enabled: bool,
     owner: Option<&Arc<crate::runtime::TaskOwner>>,
 ) -> io::Result<PacketTransportEndpoint> {
+    build_packet_transport_endpoint(transport, remote, 1252, metrics_enabled, owner)
+}
+
+fn build_packet_transport_endpoint(
+    transport: Arc<dyn PacketTransport>,
+    remote: SocketAddr,
+    mtu: u16,
+    metrics_enabled: bool,
+    owner: Option<&Arc<crate::runtime::TaskOwner>>,
+) -> io::Result<PacketTransportEndpoint> {
     if transport.relay_addr() != remote {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -579,12 +712,17 @@ pub fn packet_transport_endpoint_with_metrics(
         ));
     }
     let drivers = Arc::new(crate::runtime::TaskOwner::production());
+    // The adapter workers belong to this endpoint, not to whatever short-lived
+    // scope happened to dial the detour. Passing an explicit owner stops
+    // `spawn_joinable` from inheriting that scope and aborting the workers while
+    // a connection is still reading through them.
+    let worker_owner = owner.cloned().unwrap_or_else(|| Arc::clone(&drivers));
     let runtime = OwnedTaskRuntime::new(&drivers, owner)?;
-    let config = endpoint_config_with_mtu(1252)?;
+    let config = endpoint_config_with_mtu(mtu)?;
     let (socket, sender, receiver) =
         TransportQuinnSocket::prepare(transport, remote, metrics_enabled);
     let endpoint = Endpoint::new_with_abstract_socket(config, None, socket.clone(), runtime)?;
-    socket.start_workers(owner, sender, receiver)?;
+    socket.start_workers(Some(&worker_owner), sender, receiver)?;
     Ok(PacketTransportEndpoint {
         endpoint,
         socket,

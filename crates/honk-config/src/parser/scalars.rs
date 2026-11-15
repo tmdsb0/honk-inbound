@@ -86,6 +86,7 @@ pub(super) const GLOBAL_KEYS: &[&str] = &[
     "check_interval",
     "check_tolerance",
     "dial_mode",
+    "masque_tunnel_mode",
     "nfqueue_enable",
     "allow_insecure",
     "sniffing_timeout",
@@ -413,6 +414,9 @@ pub(super) fn parse_global_section(
     }
     if let Some(value) = settings.get("dial_mode").map(|text| text.unquote().raw()) {
         cfg.dial_mode = value.to_owned();
+    }
+    if let Some(value) = settings.get("masque_tunnel_mode").map(|text| text.unquote().raw()) {
+        cfg.masque_tunnel_mode = value.to_owned();
     }
     if let Some(value) = settings.get("nfqueue_enable") {
         cfg.nfqueue_enable = strict_bool(value.unquote().raw()).ok_or_else(|| {

@@ -213,7 +213,16 @@ pub(crate) async fn maybe_tls_wrap_concrete(
         let alpn = node.is_xhttp().then_some(b"\x02h2".as_slice());
         let setup = async {
             let tcp = initial_tcp.await?;
-            let peer = tcp.peer_addr()?;
+            // A detour hands back a chained carrier (a byte stream), not a
+            // socket, so `peer_addr()` cannot answer. The re-dial target is
+            // the endpoint `initial_tcp` already resolved and dialled; using
+            // it keeps the replacement handshake on exactly the same fronted
+            // path instead of leaking out of the real interface.
+            let peer = if detour.is_some() {
+                crate::proxy::detour::resolve_endpoint(&address).await?
+            } else {
+                tcp.peer_addr()?
+            };
             let tcp = ObservedTcp::new_carrier(tcp);
             let chrome = crate::tls::chrome_mode();
             let mut tls_stream = match crate::reality::reality_connect_with_key_shares(

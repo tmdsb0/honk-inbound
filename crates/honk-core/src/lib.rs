@@ -836,6 +836,13 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         // in the config (Direct/Block protocols → DirectHandler/BlockHandler).
         config.ensure_builtin_nodes();
 
+        // Record the MASQUE tunnel backend chosen from `global.masque_tunnel_mode`
+        // once at boot. A reload rebuilds tunnels but keeps the backend chosen
+        // here, so the setting is a boot-time decision, not a hot-reload one.
+        honk_outbound::proxy::masque::set_masque_tunnel_backend(
+            honk_outbound::proxy::masque::TunnelBackend::parse(&config.global.masque_tunnel_mode),
+        );
+
         // Relay tuning is operational, not routing: apply it before the first
         // flow so `global { relay_buf_size: '...' }` takes effect without a
         // rebuild. An unparsable value keeps the compiled-in default.

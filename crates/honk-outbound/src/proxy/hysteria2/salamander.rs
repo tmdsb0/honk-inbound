@@ -391,3 +391,72 @@ pub(super) fn hy2_endpoint_factory(
         )
     }
 }
+
+/// Salamander obfuscation for a fronted path.
+///
+/// On a direct dial `Hy2UdpSocket` seals and opens datagrams at the socket
+/// boundary. A detour hands back a framed UDP transport instead of a socket,
+/// so the same transform has to happen one layer up: every QUIC datagram is
+/// sealed before the front node forwards it, and opened on the way back. The
+/// QUIC endpoint above sees plain datagrams either way, and the server still
+/// sees exactly the obfuscated wire format the node was configured with.
+#[derive(Debug)]
+pub(super) struct SalamanderPacketTransport {
+    inner: Arc<dyn crate::proxy::PacketTransport>,
+    password: Arc<[u8]>,
+}
+
+/// Build the `QuicClient` hook that keeps obfuscation on fronted paths.
+pub(super) fn salamander_transport_transform(
+    password: Arc<[u8]>,
+) -> crate::quic::DetourTransportTransform {
+    let transform: crate::quic::DetourTransportTransform = Arc::new(move |inner| {
+        Arc::new(SalamanderPacketTransport {
+            inner,
+            password: Arc::clone(&password),
+        })
+    });
+    transform
+}
+
+#[async_trait::async_trait]
+impl crate::proxy::PacketTransport for SalamanderPacketTransport {
+    fn relay_addr(&self) -> SocketAddr {
+        self.inner.relay_addr()
+    }
+
+    fn allows_full_cone_replies(&self) -> bool {
+        self.inner.allows_full_cone_replies()
+    }
+
+    fn send_timeout(&self) -> Duration {
+        self.inner.send_timeout()
+    }
+
+    fn send_timeout_is_congestion(&self) -> bool {
+        self.inner.send_timeout_is_congestion()
+    }
+
+    async fn send_packet(&self, data: &[u8]) -> io::Result<()> {
+        let mut sealed = Vec::with_capacity(SALAMANDER_SALT_LEN + data.len());
+        salamander_seal_into(self.password.as_ref(), data, &mut sealed);
+        self.inner.send_packet(&sealed).await
+    }
+
+    async fn send_packet_confirmed(&self, data: &[u8]) -> io::Result<()> {
+        let mut sealed = Vec::with_capacity(SALAMANDER_SALT_LEN + data.len());
+        salamander_seal_into(self.password.as_ref(), data, &mut sealed);
+        self.inner.send_packet_confirmed(&sealed).await
+    }
+
+    async fn recv_packet(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        let (length, peer) = self.inner.recv_packet(buf).await?;
+        // A malformed datagram is not a transport failure: a front node may
+        // forward stray packets. Report an empty payload so quinn drops it
+        // without tearing down the adapter workers.
+        match salamander_open(self.password.as_ref(), &mut buf[..length]) {
+            Some(length) => Ok((length, peer)),
+            None => Ok((0, peer)),
+        }
+    }
+}

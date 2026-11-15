@@ -7,6 +7,10 @@
 //! [`DetourPath`]. A group is the one part that cannot be resolved that early,
 //! and it is resolved again on every dial instead.
 //!
+//! There are two callers: a node's own `dialer-proxy` is bound once per
+//! generation, while a group's `detour` is resolved into a fresh path on each
+//! dial and takes precedence over the node's binding.
+//!
 //! A dial through it yields the same byte stream a socket would, and for UDP
 //! the same framed transport, so the protocol above does not have to know
 //! which path it is on.
@@ -38,6 +42,38 @@ pub fn ensure_bound(node: &Node, detour: Option<&DetourPath>) -> anyhow::Result<
         );
     }
     Ok(())
+}
+
+/// Error context shared by every fronted QUIC dial. Keeping the wording in one
+/// place means a `QuicClient` handshake and a MASQUE h3 tunnel report the same
+/// failure identically, and there is a single place to change it.
+pub(crate) fn udp_carry_context(addr: impl std::fmt::Display) -> String {
+    format!("detour could not carry UDP to {addr}")
+}
+
+pub(crate) fn quic_endpoint_context(addr: impl std::fmt::Display) -> String {
+    format!("QUIC endpoint over the detour to {addr}")
+}
+
+pub(crate) fn transport_error_context(cause: impl std::fmt::Display) -> String {
+    format!("QUIC transport error: {cause}")
+}
+
+/// Which group member carries a detour, on each network a MASQUE tunnel can be
+/// dialled on. The tunnel cache compares the whole signature.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CarrierSignature {
+    pub tcp: Option<uuid::Uuid>,
+    pub udp: Option<uuid::Uuid>,
+}
+
+/// Read a group's current carrier without advancing its selection state.
+fn peek_carrier(manager: &GroupManager, name: &str, domain: ProbeDomain) -> Option<uuid::Uuid> {
+    manager
+        .peek_selection_plan_for_domain(name, domain, IpVersion::V4)
+        .nodes
+        .first()
+        .map(|node| node.id)
 }
 
 /// Resolve a `host:port` pair to an address a detour can dial.
@@ -162,21 +198,25 @@ impl DetourPath {
         }
     }
 
-    /// The node that will carry the next dial, read without advancing group
-    /// state (round-robin cursors, URLTest caches, marks).
+    /// The member carrying this path on each network, read without advancing
+    /// group state (round-robin cursors, URLTest caches, marks).
     ///
     /// A MASQUE tunnel is not like an ordinary stream: it dials its server
     /// once and every later flow rides that same carrier. A group's current
     /// member can therefore change while the tunnel is still alive, and the
     /// cache must notice that the tunnel belongs to the old front.
-    pub(crate) fn carrier_id(&self) -> Option<uuid::Uuid> {
+    /// `connect_udp` selects with `ProbeDomain::DataUdp` while a TCP dial uses
+    /// `Tcp`, so both have to take part in that comparison.
+    pub(crate) fn carrier_signature(&self) -> CarrierSignature {
         match &self.target {
-            DetourTarget::Node(node_id) => Some(*node_id),
-            DetourTarget::Group { name, manager } => manager
-                .peek_selection_plan_for_domain(name, ProbeDomain::Tcp, IpVersion::V4)
-                .nodes
-                .first()
-                .map(|node| node.id),
+            DetourTarget::Node(node_id) => CarrierSignature {
+                tcp: Some(*node_id),
+                udp: Some(*node_id),
+            },
+            DetourTarget::Group { name, manager } => CarrierSignature {
+                tcp: peek_carrier(manager, name, ProbeDomain::Tcp),
+                udp: peek_carrier(manager, name, ProbeDomain::DataUdp),
+            },
         }
     }
 
@@ -405,10 +445,10 @@ mod tests {
             NodeProtocol::Trojan,
         );
 
-        assert_eq!(path.carrier_id(), Some(first));
+        assert_eq!(path.carrier_signature().tcp, Some(first));
         manager
             .set_selector_choice("fronts", "front-b", crate::group::SelectorNetworks::Both)
             .unwrap();
-        assert_eq!(path.carrier_id(), Some(second));
+        assert_eq!(path.carrier_signature().tcp, Some(second));
     }
 }

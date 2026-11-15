@@ -217,9 +217,12 @@ async fn endpoint_retains_worker_cause_and_rejection() {
     use crate::group::ScoreOutcome;
     let remote = "127.0.0.1:443".parse().unwrap();
     for rejection in [None, Some(PacketRejection::Capacity)] {
-        let endpoint =
-            packet_transport_endpoint(Arc::new(SendFailedPacketTransport(rejection)), remote)
-                .unwrap();
+        let endpoint = packet_transport_endpoint_with_mtu(
+            Arc::new(SendFailedPacketTransport(rejection)),
+            remote,
+            1252,
+        )
+        .unwrap();
         quinn::AsyncUdpSocket::try_send(
             &*endpoint.socket,
             &quinn::udp::Transmit {
@@ -264,13 +267,14 @@ async fn endpoint_retains_worker_cause_and_rejection() {
 #[tokio::test]
 async fn zero_timeout_close_does_not_surface_adapter_error() {
     let remote: SocketAddr = "127.0.0.1:443".parse().unwrap();
-    let endpoint = packet_transport_endpoint(
+    let endpoint = packet_transport_endpoint_with_mtu(
         Arc::new(AdmissionPacketTransport {
             confirmed: AtomicUsize::new(0),
             ordinary: AtomicUsize::new(0),
             ordinary_sent: tokio::sync::Notify::new(),
         }),
         remote,
+        1252,
     )
     .unwrap();
 
@@ -614,12 +618,13 @@ async fn endpoint_close_keeps_worker_panic_failure_after_first_join() {
         .await
         .unwrap();
     let panicked = Arc::new(tokio::sync::Notify::new());
-    let endpoint = packet_transport_endpoint(
+    let endpoint = packet_transport_endpoint_with_mtu(
         Arc::new(PanicReceiveTransport {
             inner: UdpPacketTransport { socket, remote },
             panicked: Arc::clone(&panicked),
         }),
         remote,
+        1252,
     )
     .unwrap();
     panicked.notified().await;
