@@ -12,11 +12,11 @@
 | `upstream { ... }` | `default: 'udp://223.5.5.5:53'` | Named upstream servers. The first explicit `upstream` block replaces the built-in entry. |
 | `routing { ... }` | no rules; request fallback `default`; response fallback `accept` | Ordered request and response routing. |
 | `ipversion_prefer` | omitted: `both` | `4` selects `preferipv4`; `6` selects `preferipv6`; `0` is dae's no preference, `both`. A value honk cannot parse keeps `both` and is reported as a diagnostic. |
-| `optimistic_cache` | `true` | Enables positive and negative cache reads and writes. |
-| `optimistic_cache_ttl` | `600` seconds | Fixed positive-answer cache and wire TTL, excluding NODATA; `0` preserves the answer TTL. |
+| `optimistic_cache` | `true` | Enables positive cache reads and writes. |
+| `optimistic_cache_ttl` | `600` seconds | Fixed positive-answer cache and wire TTL; `0` preserves the answer TTL. |
 | `optimistic_stale_reply_ttl` | `30` seconds | TTL for served-stale positive answers; a non-zero value replaces every non-OPT RR TTL, while `0` preserves cached policy-rewritten wire TTLs rather than authoritative TTLs. |
 | `max_cache_size` | `10000` | Maximum cache entries, at most 100,000; also determines the per-shard byte budget below. |
-| `fixed_domain_ttl { ... }` | empty | Per-domain positive and NODATA TTL overrides; `0` disables caching for every response code, including negatives. |
+| `fixed_domain_ttl { ... }` | empty | Per-domain positive-answer TTL overrides; `0` disables caching for that domain. |
 
 Scalar values own the remainder of their physical line and split only at the key colon, so bare IPv6 endpoints and `client_subnet: auto(9.9.9.9)` remain intact. Exactly one matched enclosing quote pair is removed. An opened scalar quote must close on the same line; malformed quotes fail the configuration.
 
@@ -214,26 +214,32 @@ The internal `ipv4only` and `ipv6only` modes are not expressible with dae `ipver
 | Key | Default | Behavior |
 | --- | --- | --- |
 | `optimistic_cache` | `true` | Enables cache reads and publications. |
-| `optimistic_cache_ttl` | `600` | Overrides the positive answer's minimum TTL for cache lifetime and returned wire RR TTLs, but never applies to NODATA. `0` keeps the answer TTL. |
+| `optimistic_cache_ttl` | `600` | Overrides the positive answer's minimum TTL for cache lifetime and returned wire RR TTLs. `0` keeps the answer TTL. |
 | `optimistic_stale_reply_ttl` | `30` seconds | Served-stale positive answers use this TTL; a non-zero value replaces every non-OPT RR TTL. `0` preserves cached policy-rewritten wire TTLs rather than authoritative TTLs; in that case, the outcome TTL derives from `extract_min_ttl` of that wire, falling back to 60 seconds when no positive TTL exists. For a non-zero value, the outcome TTL is the configured value even when no positive TTL exists. |
 | `max_cache_size` | `10000` | Entry limit, divided across at most 16 shards. Each shard's answer-byte budget is `max(entry capacity × 1 KiB, 65,535 bytes)`; it evicts LRU entries until both limits hold. Individual answers over 65,535 bytes are not cached. Values above 100,000 clamp to 100,000 and `0` to one entry, each with a warning. |
-| `fixed_domain_ttl { domain: seconds }` | empty | Per-domain override applied before `optimistic_cache_ttl`; `0` disables caching for every response code, including NXDOMAIN and SERVFAIL. |
+| `fixed_domain_ttl { domain: seconds }` | empty | Per-domain override applied before `optimistic_cache_ttl`; `0` disables caching for that domain. |
 
 Request routing runs before cache lookup. Cache and background-refresh identity uses the selected upstream or exact `asis` destination, not the raw client source: clients selecting the same exchange scope share entries, while different selected upstreams or `asis` destinations remain isolated. Preferred-family rendering still retains source metadata, so source-dependent sibling policy cannot leak through foreground singleflight.
 
-With `optimistic_cache_ttl: 0` and no `fixed_domain_ttl` override, a positive NOERROR answer uses the minimum TTL across all non-OPT answer, authority, and additional records. If any such TTL is zero, honk does not cache the response and supersedes the exact cache slot, preventing either an old address or an older negative from returning. A nonzero configured or fixed TTL still overrides that zero. Other failure response codes retain their existing TTL behavior.
+With `optimistic_cache_ttl: 0` and no `fixed_domain_ttl` override, a positive NOERROR answer uses the minimum TTL across all non-OPT answer, authority, and additional records. If any such TTL is zero, honk does not cache the response and supersedes the exact cache slot, preventing an old address from returning. A nonzero configured or fixed TTL still overrides that zero. Failure response codes (NXDOMAIN, SERVFAIL, NODATA) are never cached.
 
 Disabling cache retention does not disable DNS routing projection. An accepted uncacheable positive answer (including `fixed_domain_ttl: 0`) uses the minimum positive non-OPT wire TTL for projection, falling back to 60 seconds when all such TTLs are zero. This does not rewrite the reply or make it cacheable; cache-hit remaining lifetimes and served-stale lifetimes are unchanged.
 
 ### Negative answers
 
-NXDOMAIN is cached for `min(SOA TTL, SOA MINIMUM, 300)` seconds. Missing SOA or a zero SOA lifetime prevents caching and removes the existing positive and negative values for the exact cache key, so an old address cannot return as stale. A foreground result replaces whichever publication is present; a refresh removes only the revision it started from. `fixed_domain_ttl: 0` prevents caching without removing an existing entry. SERVFAIL otherwise retains its SOA-derived lifetime, defaulting to 60 seconds and clamped to `1..=300`.
+Only successful resolutions that return at least one address are cached.
+NXDOMAIN, SERVFAIL, and NODATA are never stored: a failed lookup leaves
+the cache untouched, so the next query re-asks the upstream, and a
+previously cached good answer keeps serving until its own TTL expires.
+A positive answer carrying no addresses — for example a CNAME-only reply —
+is not cached either.
 
-NODATA here means NOERROR with no answer records (`ANCOUNT=0`); a nonempty answer, including a CNAME/DNAME-only answer, remains positive. NODATA retains its full wire response in the positive slot for `min(SOA TTL, SOA MINIMUM, 300)` seconds. A nonzero `fixed_domain_ttl` takes precedence over both SOA and the cap, including when SOA is absent. Without that override, missing SOA or zero lifetime supersedes the exact slot without caching, just as for NXDOMAIN.
+NODATA here means NOERROR with no answer records (`ANCOUNT=0`); a nonempty
+answer, including a CNAME/DNAME-only answer, remains positive.
 
-Cached NODATA remains eligible for serve-stale; the stale rewrite changes the SOA record TTL, not SOA MINIMUM. A response-policy `reject` applied to upstream NODATA produces an empty NOERROR wire; its cache lifetime follows the same TTL rules using the rejected answer's SOA, not the synthetic wire. Subsequent requests reuse the synthetic response for that lifetime.
-
-Cache lifetime selection uses the original upstream answer's class, response code, and TTL even when response-policy `reject` replaces the reply with synthetic NOERROR. A rejected REFUSED therefore keeps the failure-code TTL rules; a rejected positive NOERROR uses its original TTLs when no configured or fixed override applies.
+A response-policy `reject` replaces the reply with an empty NOERROR wire for
+the caller, but the substitute is never cached; the next query re-asks the
+upstream.
 
 Cache hits do not count down wire record TTLs. Supersession affects memory only; it does not delete a saved persistence row.
 
