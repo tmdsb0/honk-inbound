@@ -1,3 +1,4 @@
+use std::net::IpAddr;
 use std::time::Instant;
 
 use tracing::debug;
@@ -7,7 +8,7 @@ use super::ExecutionContext;
 use crate::dns::cache::{CacheKey, ExactLookup, OperationKind};
 use crate::dns::forwarder::{
     CacheAccess, DnsForwardError, ResolveMode, extract_min_ttl, extract_min_ttl_including_zero,
-    extract_soa_negative_ttl, rewrite_answer_ttls,
+    rewrite_answer_ttls,
 };
 use crate::dns::outcome::{DnsOutcome, EffectiveExpiry, OutcomeStatus, Provenance, ResponseClass};
 #[cfg(feature = "native-api")]
@@ -154,8 +155,21 @@ pub(super) async fn store(
     response: &mut [u8],
     rejected_wire: Option<&[u8]>,
     class: ResponseClass,
+    answer_ips: Option<&[IpAddr]>,
 ) -> (EffectiveExpiry, Option<u64>) {
-    let lifetime_wire = rejected_wire.unwrap_or(response);
+    // Only resolutions that yielded at least one address are cached. A
+    // rejected response reaches the caller as an empty answer, and a failed
+    // lookup (NXDOMAIN, SERVFAIL, NODATA) — or a positive answer carrying
+    // no addresses, such as a CNAME-only reply — carries no usable address;
+    // storing any of them would leave the name unresolvable until the entry
+    // expires, even after the upstream can answer again. Leave the cache
+    // untouched instead of superseding a good entry.
+    if rejected_wire.is_some()
+        || !matches!(class, ResponseClass::Positive)
+        || answer_ips.map_or(true, |ips| ips.is_empty())
+    {
+        return (EffectiveExpiry::do_not_cache(), None);
+    }
     if !context.reuse_eligible {
         return (EffectiveExpiry::do_not_cache(), None);
     }
@@ -166,32 +180,13 @@ pub(super) async fn store(
     if fixed_ttl == Some(0) {
         return (EffectiveExpiry::do_not_cache(), None);
     }
-    // Rejection rewrites the reply to NOERROR, not the upstream TTL policy.
-    let rcode = lifetime_wire.get(3).copied().unwrap_or_default() & 0x0f;
-    let negative = matches!(class, ResponseClass::Nxdomain | ResponseClass::Servfail);
-    let expiry = if negative {
-        let soa_ttl = extract_soa_negative_ttl(lifetime_wire);
-        let ttl = if class == ResponseClass::Nxdomain {
-            soa_ttl.unwrap_or(0).min(300)
-        } else {
-            soa_ttl.unwrap_or(60).clamp(1, 300)
-        };
-        effective_expiry(None, 0, ttl)
-    } else if class == ResponseClass::Nodata && rcode == 0 {
-        let ttl = fixed_ttl.unwrap_or_else(|| {
-            extract_soa_negative_ttl(lifetime_wire)
-                .unwrap_or(0)
-                .min(300)
-        });
-        effective_expiry(None, 0, ttl)
+    let rcode = response.get(3).copied().unwrap_or_default() & 0x0f;
+    let answer_ttl = if rcode == 0 {
+        extract_min_ttl_including_zero(response)
     } else {
-        let answer_ttl = if class == ResponseClass::Positive && rcode == 0 {
-            extract_min_ttl_including_zero(lifetime_wire)
-        } else {
-            extract_min_ttl(lifetime_wire)
-        };
-        effective_expiry(fixed_ttl, context.forwarder.cache_ttl, answer_ttl)
+        extract_min_ttl(response)
     };
+    let expiry = effective_expiry(fixed_ttl, context.forwarder.cache_ttl, answer_ttl);
     let mut revision = None;
     if context.forwarder.cache_enabled {
         let cache = context.forwarder.cache_service().await;
@@ -203,24 +198,14 @@ pub(super) async fn store(
             );
         } else {
             let cache_ttl = expiry.ttl().as_secs().min(u64::from(u32::MAX)) as u32;
-            if negative {
-                revision = cache.put_negative_if_current(
-                    context.publication_epoch,
-                    cache_key.clone(),
-                    cache_ttl,
-                    rcode,
-                    context.refreshing,
-                );
-            } else {
-                rewrite_answer_ttls(response, cache_ttl);
-                revision = cache.put_exact_if_current(
-                    context.publication_epoch,
-                    cache_key.clone(),
-                    response.to_owned(),
-                    cache_ttl,
-                    context.refreshing,
-                );
-            }
+            rewrite_answer_ttls(response, cache_ttl);
+            revision = cache.put_exact_if_current(
+                context.publication_epoch,
+                cache_key.clone(),
+                response.to_owned(),
+                cache_ttl,
+                context.refreshing,
+            );
         }
     }
     (expiry, revision)
