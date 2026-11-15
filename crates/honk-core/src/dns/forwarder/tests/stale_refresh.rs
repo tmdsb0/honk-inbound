@@ -503,7 +503,7 @@ async fn wait_for_refresh_completion(forwarder: &DnsForwarder) {
 }
 
 #[tokio::test]
-async fn refresh_nxdomain_without_soa_retires_the_refreshed_positive() {
+async fn refresh_nxdomain_without_soa_keeps_positive_for_stale_serve() {
     let query = make_a_query();
     let upstream = Arc::new(RefreshFenceUpstream {
         initial: make_a_response([192, 0, 2, 1], 1),
@@ -525,15 +525,21 @@ async fn refresh_nxdomain_without_soa_retires_the_refreshed_positive() {
     upstream.refresh_release.add_permits(1);
     wait_for_refresh_completion(&forwarder).await;
 
-    let error = forwarder
+    // The refresh NXDOMAIN is not cached and does not retire the positive,
+    // so the expired entry is still served stale once upstream fails.
+    let stale = forwarder
         .resolve_outcome(&query)
         .await
-        .expect_err("retired positive must not be served stale");
-    assert!(matches!(error.unshared(), DnsForwardError::Exchange { .. }));
+        .expect("expired positive must be served stale");
+    assert_eq!(
+        stale.answer_ips(),
+        &[IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 1))]
+    );
+    assert_eq!(stale.provenance(), Provenance::Stale);
 }
 
 #[tokio::test]
-async fn foreground_nxdomain_retires_expired_positive() {
+async fn foreground_nxdomain_keeps_expired_positive_for_stale_serve() {
     let query = make_a_query();
     let upstream = Arc::new(RefreshFenceUpstream {
         initial: make_a_response([192, 0, 2, 1], 1),
@@ -553,11 +559,18 @@ async fn foreground_nxdomain_retires_expired_positive() {
     let negative = forwarder.resolve_outcome(&query).await.expect("nxdomain");
     assert_eq!(negative.response_class(), ResponseClass::Nxdomain);
 
-    let error = forwarder
+    // The foreground NXDOMAIN is not cached and does not retire the
+    // positive, so the expired entry is still served stale once upstream
+    // fails.
+    let stale = forwarder
         .resolve_outcome(&query)
         .await
-        .expect_err("retired positive must not be served stale");
-    assert!(matches!(error.unshared(), DnsForwardError::Exchange { .. }));
+        .expect("expired positive must be served stale");
+    assert_eq!(
+        stale.answer_ips(),
+        &[IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 1))]
+    );
+    assert_eq!(stale.provenance(), Provenance::Stale);
 }
 
 #[tokio::test]
@@ -631,7 +644,7 @@ async fn owning_refresh_publishes_a_changed_positive() {
 }
 
 #[tokio::test]
-async fn held_refresh_does_not_overwrite_a_newer_foreground_nxdomain() {
+async fn held_refresh_positive_is_published_when_foreground_nxdomain_is_not_cached() {
     let query = make_a_query();
     let foreground = make_nxdomain_response(&query, 1, 1);
     let upstream = Arc::new(RefreshFenceUpstream {
@@ -663,14 +676,19 @@ async fn held_refresh_does_not_overwrite_a_newer_foreground_nxdomain() {
     upstream.refresh_release.add_permits(1);
     wait_for_refresh_completion(&forwarder).await;
 
-    let retained = forwarder
+    // The foreground NXDOMAIN is not cached, so the held refresh's
+    // positive is the entry that gets published and served.
+    let published = forwarder
         .resolve_outcome(&query)
         .await
-        .expect("negative hit");
-    assert_eq!(retained.status(), OutcomeStatus::Accepted);
-    assert_eq!(retained.response_class(), ResponseClass::Nxdomain);
-    assert_eq!(retained.provenance(), Provenance::Cache);
-    assert_eq!(retained.rendered()[3] & 0x0f, 3);
+        .expect("refreshed positive");
+    assert_eq!(published.status(), OutcomeStatus::Accepted);
+    assert_eq!(published.response_class(), ResponseClass::Positive);
+    assert_eq!(published.provenance(), Provenance::Cache);
+    assert_eq!(
+        published.answer_ips(),
+        &[IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 2))]
+    );
 }
 
 #[tokio::test]

@@ -328,6 +328,11 @@ async fn selected_scopes_partition_overlapping_positive_and_negative_queries() {
             let (source, response) = result.expect("task");
             assert_response(source, &response);
         }
+        // Negative answers are never cached: the second round re-asks the
+        // upstream, so each sequential resolve needs a fresh release permit.
+        if negative {
+            upstream.release.add_permits(3);
+        }
         for source in sources {
             let response = forwarder
                 .resolve_outcome_with_context(
@@ -339,8 +344,13 @@ async fn selected_scopes_partition_overlapping_positive_and_negative_queries() {
                 .into_rendered();
             assert_response(source, &response);
         }
-        assert_eq!(upstream.calls("red"), 1);
-        assert_eq!(upstream.calls("blue"), 1);
+        if negative {
+            assert_eq!(upstream.calls("red"), 3);
+            assert_eq!(upstream.calls("blue"), 2);
+        } else {
+            assert_eq!(upstream.calls("red"), 1);
+            assert_eq!(upstream.calls("blue"), 1);
+        }
         assert_eq!(upstream.calls("trap"), 0);
     }
 }

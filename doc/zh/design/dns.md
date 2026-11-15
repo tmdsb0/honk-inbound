@@ -113,7 +113,7 @@ Honk 的独立 bind 可以是 `:53530`、其他空闲端口或关闭；它不是
 | 2. 解析与校验 | adapter 要求一条完整请求。`DnsEngine` 解析 wire，拒绝没有可用问题或有多个问题的请求，生成小写的路由域名而不改变 qname 的大小写，并记录入口 profile。 |
 | 3. 地址族 gate 与 hosts | `ipv4only`/`ipv6only` 在 hosts 或上游工作前，以 NODATA 拒绝另一地址族。除此之外，不可变 hosts 快照先于请求路由、缓存与上游交换执行。 |
 | 4. 请求规划 | 按源码顺序的请求规则依据路由域名、QTYPE 与逻辑客户端来源选择 reject、`asis` 或命名上游。首条命中。 |
-| 5. 复用 | 符合资格的请求先查询精确身份的正/负缓存；未命中时共用一次 singleflight 交换。不符合资格的请求绕过两者。 |
+| 5. 复用 | 符合资格的请求先查询精确身份的正缓存；未命中时共用一次 singleflight 交换。不符合资格的请求绕过两者。 |
 | 6. 交换 | 请求 scope 选择拦截所得目的地址或某个 `UpstreamPool` transport。 |
 | 7. 响应规划 | 策略使用每个上游响应前，都会严格核对其与查询是否匹配。响应规则执行 accept、reject 或经命名上游重新查询；遍历无环且最多包含三个上游。 |
 | 8. 发布与渲染 | 只有严格校验后的最终 wire 响应才能进入缓存或发布给 singleflight waiter。偏好地址族压制在保存已校验、可复用的应答后，才应用于调用方渲染。 |
@@ -136,7 +136,7 @@ waiter clone 原始 causal chain，而不是从 display 文本重建。完成的
 
 构建 generation 时会按声明顺序读取并合并每个可重复的 `use_host` 来源。`true` 选择 `/etc/hosts`，其解析器索引精确名称及别名；路径选择 OxiDNS 兼容的精确、domain 后缀、regexp 和 keyword 规则文件。后定义的同名规则覆盖先定义的规则；精确与最长后缀匹配优先于有序的 regexp 和 keyword 匹配。查询处理不执行文件 I/O。
 
-只有 IN class 的 A 与 AAAA 查询使用该快照。已知名称缺少所请求地址族时返回 `NOERROR`/NODATA，绝不泄漏给上游。hosts 应答 TTL 为 60 秒，绕过正缓存与负缓存复用，但仍产生正常的路由投影结果。快照在其 generation 内不可变；修改来源后发送 SIGHUP 以发布替换项。加载或解析失败会令启动失败，或在发布前中止 reload。
+只有 IN class 的 A 与 AAAA 查询使用该快照。已知名称缺少所请求地址族时返回 `NOERROR`/NODATA，绝不泄漏给上游。hosts 应答 TTL 为 60 秒，绕过正缓存复用，但仍产生正常的路由投影结果。快照在其 generation 内不可变；修改来源后发送 SIGHUP 以发布替换项。加载或解析失败会令启动失败，或在发布前中止 reload。
 
 ### 地址族策略
 
@@ -192,7 +192,7 @@ canonical query wire (TXID zeroed)
 
 wire 身份保留 flags、精确 question 编码、QCLASS 与 EDNS 内容。UDP 声明大小仍属于入口 profile。逻辑 request scope 在请求路由后确定：它区分命名上游与 `asis` 目的地址，policy identity 防止跨语义 reload 复用。
 
-客户端 IP 不属于缓存或持久化身份。不同来源选择同一命名上游时共享其与来源无关的应答；选择不同上游时由 scope 自然隔离，`asis` 仍按原始目的地址隔离。前台 `FlightKey::Resolve` 包含 resolve `CacheKey`，始终额外区分 strict/compatibility mode，并且仅在 preference-sensitive sibling 查询可能改变发布应答时加入 `DnsRequestMeta`；其他前台 flight 仍可跨客户端合并。后台 `FlightKey::Refresh` 只包含 refresh `CacheKey`，由 leader 捕获发起方 metadata 与 mode。正缓存、负缓存与 stale 命中都会用当前调用方 metadata 重新执行偏好地址族渲染。
+客户端 IP 不属于缓存或持久化身份。不同来源选择同一命名上游时共享其与来源无关的应答；选择不同上游时由 scope 自然隔离，`asis` 仍按原始目的地址隔离。前台 `FlightKey::Resolve` 包含 resolve `CacheKey`，始终额外区分 strict/compatibility mode，并且仅在 preference-sensitive sibling 查询可能改变发布应答时加入 `DnsRequestMeta`；其他前台 flight 仍可跨客户端合并。后台 `FlightKey::Refresh` 只包含 refresh `CacheKey`，由 leader 捕获发起方 metadata 与 mode。正缓存与 stale 命中都会用当前调用方 metadata 重新执行偏好地址族渲染。
 
 仅被 compatibility mode 接受的响应链不会进入共享内存缓存或持久化，例如终止于响应路由环/深度上限，或未通过 strict response-template 校验的响应链。因此后续 strict 查询不会继承 compatibility-only 的接受结果。由于 HDNS v2 不存储执行模式来源，恢复的条目在当前进程完成一次上游交换并替换它们之前仅供 compatibility mode 使用；持久化 codec 仍保持 v2。
 
@@ -205,19 +205,19 @@ wire 身份保留 flags、精确 question 编码、QCLASS 与 EDNS 内容。UDP 
 | 机制 | 不变量 |
 | --- | --- |
 | 容量 | 最多 16 个 LRU 分片精确划分 `max_cache_size`（钳制为 1–100,000）。每个分片的应答字节预算为 `max(条目容量 × 1 KiB, 65,535 字节)`；单条超过 65,535 字节的应答不缓存。 |
-| 正缓存 TTL | `fixed_domain_ttl` 优先级最高；零表示该域名不缓存。否则，非零 `optimistic_cache_ttl` 覆盖应答最小 TTL。两者均未覆盖时，NOERROR 正应答取所有已遍历非 OPT 记录的最小 TTL，包括零；最小值为零时移除精确缓存槽，不保留新应答。选定的非零 TTL 也会写入缓存中的记录。失败响应码仍使用原有的 TTL 提取规则。 |
-| 负缓存 TTL | NXDOMAIN 使用 `min(SOA TTL, SOA MINIMUM, 300)` 秒；缺少 SOA 或生命周期为零时移除精确缓存槽，不保留应答。SERVFAIL 仍缺省为 60 秒，并将 SOA 得出的生命周期限制在 `1..=300` 秒。`fixed_domain_ttl: 0` 禁止缓存所有响应码的应答，但不移除已有条目。 |
-| NODATA TTL | `ANCOUNT=0` 的 NOERROR 应答以完整报文保留在正缓存槽中。非零 `fixed_domain_ttl` 优先于 SOA 和上限；否则生命周期为 `min(SOA TTL, SOA MINIMUM, 300)`，缺少 SOA 或生命周期为零时移除精确缓存槽，不保留新应答。`optimistic_cache_ttl` 不适用。NODATA 仍可作为过期应答返回；过期改写只改变 SOA TTL，不改变 MINIMUM。 |
+| 正缓存 TTL | `fixed_domain_ttl` 优先级最高；零表示该域名不缓存。否则，非零 `optimistic_cache_ttl` 覆盖应答最小 TTL。两者均未覆盖时，NOERROR 正应答取所有已遍历非 OPT 记录的最小 TTL，包括零；最小值为零时移除精确缓存槽，不保留新应答。选定的非零 TTL 也会写入缓存中的记录。失败响应码（NXDOMAIN、SERVFAIL、NODATA）永不缓存，不带地址的正应答同样不缓存。 |
+| 负缓存 TTL | NXDOMAIN 与 SERVFAIL 永不缓存；仅缓存成功解析的正应答。 |
+| NODATA TTL | `ANCOUNT=0` 的 NOERROR 应答永不缓存；仅缓存带有记录的应答。 |
 | Stale 处理 | 过期正应答在一小时内仍可用于 serve-stale。普通上游交换失败或已接受的 SERVFAIL 可返回该应答；typed local packet refusal 不可。`optimistic_stale_reply_ttl` 默认为 30 秒；非零值替换每个非 OPT RR 的 TTL，并设置 outcome TTL。`0` 保留缓存中已按策略改写的 TTL，而不是权威 TTL；此时 outcome TTL 由该 wire 的 `extract_min_ttl` 得出，不存在正 TTL 时回退为 60 秒。接近过期的命中会启动去重的 stale-while-revalidate refresh。 |
 | Flush fence | publication epoch 防止 flush 前开始的前台或后台工作在 flush barrier 后重新填充内存或持久化。 |
 
-正、负缓存命中的 outcome 在等待偏好地址族时保留条目原有的过期时刻，不通过取整后的 TTL 元数据重新计算生命周期。
+正缓存命中的 outcome 在等待偏好地址族时保留条目原有的过期时刻，不通过取整后的 TTL 元数据重新计算生命周期。
 
-后台刷新在命中正缓存时，一并读取 `Resolve` 缓存槽的发布版本号（`revision`）。每次已接受的精确键发布都会推进版本号，包括负缓存合并和持久化恢复。发布时在分片锁内检查：版本号必须一致，正缓存也必须仍在。版本号不符、缓存槽仅剩负缓存或已被淘汰时，刷新结果会被丢弃；已淘汰的槽不会因刷新完成而重新写入。
+后台刷新在命中正缓存时，一并读取 `Resolve` 缓存槽的发布版本号（`revision`）。每次已接受的精确键发布都会推进版本号。发布时在分片锁内检查：版本号必须一致，正缓存也必须仍在。版本号不符或缓存槽已被淘汰时，刷新结果会被丢弃；已淘汰的槽不会因刷新完成而重新写入。
 
-匹配且可缓存的 NXDOMAIN 先移除被刷新的正缓存，再写入负缓存；可缓存的正应答或 NODATA 替换整个缓存槽。NXDOMAIN、NODATA 或零 TTL 正应答没有可用生命周期时移除整个槽，包括其中的负缓存。若 SERVFAIL 没有可用的过期应答回退，则保留正缓存并合并负缓存。
+可缓存的正应答替换整个缓存槽；失败的刷新（NXDOMAIN、SERVFAIL、NODATA）不触动已保留的正缓存。零 TTL 正应答没有可用生命周期时移除整个槽。
 
-前台仍以最后完成的发布为准。不可缓存的 NXDOMAIN、NODATA 或零 TTL 正应答移除整个精确缓存槽；可缓存的 NXDOMAIN 仍合并在正缓存之上。例如，严格模式的前台 SERVFAIL 可使兼容模式对已恢复正缓存发起的刷新失去发布资格；负缓存过期后，该正缓存会再次可见。替换受发布 epoch 约束，通过分片的计数维护接口移除条目；转发器禁用缓存时不执行替换。缓存命中时不会递减报文 TTL。
+前台仍以最后完成的发布为准。失败的查询（NXDOMAIN、SERVFAIL、NODATA）不触动精确缓存槽；只有可缓存的正应答替换它，零 TTL 正应答没有可用生命周期时移除整个槽。替换受发布 epoch 约束，通过分片的计数维护接口移除条目；转发器禁用缓存时不执行替换。缓存命中时不会递减报文 TTL。
 
 此保证仅适用于内存；缓存槽版本号仅在进程内有效，不改变持久化格式或严格模式的应答准入。移除正缓存不会使已保存的 SQLite 行失效。若在该行过期前重启，该正缓存可能恢复为仅兼容模式可用：严格模式不会复用它，兼容模式则可能在持久化过期时间之后的一小时内继续提供过期应答。因为刷新触发条件对剩余秒数向下取整，所以刷新开始时原应答可能仍有至多 `max(min_ttl / 10, 1) + 1` 秒的实际有效期。
 

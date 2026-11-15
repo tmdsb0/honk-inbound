@@ -123,6 +123,7 @@ pub(super) async fn run(context: &ExecutionContext<'_>) -> Result<DnsOutcome, Dn
             &mut response,
             rejected_wire.as_deref(),
             class,
+            analyzed_answer_ips.as_ref().map(|(_, ips)| ips.as_slice()),
         )
         .await
     } else {
