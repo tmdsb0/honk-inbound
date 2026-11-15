@@ -171,7 +171,10 @@ impl TransportQuinnSocket {
                     match result {
                         Ok(()) => {
                             if first {
-                                tracing::info!(
+                                // One line per newly fronted endpoint. Probes
+                                // create many, so keep this diagnostic at debug
+                                // instead of flooding production info logs.
+                                tracing::debug!(
                                     bytes = data.len(),
                                     "QUIC adapter sent first datagram through detour transport"
                                 );
@@ -243,7 +246,9 @@ impl TransportQuinnSocket {
                     }
                     if first_datagram {
                         first_datagram = false;
-                        tracing::info!(
+                        // Matches the sender side: a per-endpoint handshake
+                        // diagnostic, not an info-level event.
+                        tracing::debug!(
                             bytes = n,
                             %source,
                             "QUIC adapter received first datagram from detour transport"
