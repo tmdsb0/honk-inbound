@@ -108,6 +108,34 @@ fn response(query: &[u8], ip: [u8; 4], ttl: u32) -> Vec<u8> {
     wire
 }
 
+fn cname_response(query: &[u8], ttl: u32) -> Vec<u8> {
+    let mut wire = query.to_vec();
+    wire[0..2].copy_from_slice(&[0, 0]);
+    wire[2] = 0x81;
+    wire[3] = 0x80;
+    wire[6..8].copy_from_slice(&1_u16.to_be_bytes());
+    let target = [
+        6, b't', b'a', b'r', b'g', b'e', b't', 7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3,
+        b'c', b'o', b'm', 0,
+    ];
+    wire.extend_from_slice(&[
+        0xc0,
+        0x0c,
+        0,
+        5,
+        0,
+        1,
+        ttl.to_be_bytes()[0],
+        ttl.to_be_bytes()[1],
+        ttl.to_be_bytes()[2],
+        ttl.to_be_bytes()[3],
+        0,
+        target.len() as u8,
+    ]);
+    wire.extend_from_slice(&target);
+    wire
+}
+
 fn router(
     initial: &str,
     response_rules: Vec<DnsResponseRule>,
@@ -333,6 +361,47 @@ async fn typed_outcome_rejects_response_and_skips_exchange_for_request_reject() 
     assert_eq!(outcome.status(), OutcomeStatus::Rejected);
     assert_eq!(outcome.response_class(), ResponseClass::Nodata);
     assert_eq!(outcome.provenance(), Provenance::Fresh);
+}
+
+#[tokio::test]
+async fn rejected_response_is_not_cached_as_empty_answer() {
+    // Given: upstream answers with a 3600s A record that response routing rejects.
+    let query = build_dns_query("example.com", 1);
+    let answer = response(&query, [192, 0, 2, 1], 3600);
+    let rules = vec![DnsResponseRule {
+        conditions: vec![DnsCond::Ip {
+            not: false,
+            cidrs: vec!["192.0.2.0/24".to_owned()],
+            geoip: Vec::new(),
+        }],
+        action: DnsResponseAction::Reject,
+    }];
+    let pool = exchange([("first", Ok(answer.clone())), ("first", Ok(answer))], None);
+    let forwarder = DnsForwarder::new(
+        pool.clone(),
+        Arc::new(Mutex::new(DnsCache::new(8))),
+        router("first", rules, None),
+    );
+
+    // When: the same query is resolved twice.
+    let first = forwarder
+        .resolve_outcome(&query)
+        .await
+        .expect("rejected outcome");
+    let second = forwarder
+        .resolve_outcome(&query)
+        .await
+        .expect("second outcome");
+
+    // Then: both resolutions reach upstream — the empty substitute is never
+    // cached — and neither carries an address.
+    assert_eq!(first.status(), OutcomeStatus::Rejected);
+    assert_eq!(first.provenance(), Provenance::Upstream);
+    assert!(first.answer_ips().is_empty());
+    assert_eq!(second.status(), OutcomeStatus::Rejected);
+    assert_eq!(second.provenance(), Provenance::Upstream);
+    assert!(second.answer_ips().is_empty());
+    assert_eq!(pool.calls.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
@@ -730,10 +799,13 @@ async fn identical_ineligible_queries_reach_upstream_independently_when_overlapp
 }
 
 #[tokio::test]
-async fn negative_outcome_expiry_matches_insert_and_cache_hit_lifetime() {
+async fn negative_outcome_is_not_cached_and_requeries_upstream() {
     let query = build_dns_query("example.com", 1);
     let nxdomain = crate::dns::forwarder::make_nxdomain_response(&query, 30, 20);
-    let pool = exchange([("first", Ok(nxdomain))], None);
+    let pool = exchange(
+        [("first", Ok(nxdomain.clone())), ("first", Ok(nxdomain))],
+        None,
+    );
     let forwarder = DnsForwarder::new(
         pool.clone(),
         Arc::new(Mutex::new(DnsCache::new(8))),
@@ -741,26 +813,107 @@ async fn negative_outcome_expiry_matches_insert_and_cache_hit_lifetime() {
     )
     .with_cache_ttl(600);
 
-    let inserted = forwarder
+    let first = forwarder
         .resolve_outcome(&query)
         .await
         .expect("negative miss");
-    let hit = forwarder
+    let second = forwarder
         .resolve_outcome(&query)
         .await
-        .expect("negative hit");
+        .expect("negative requery");
 
-    assert_eq!(inserted.response_class(), ResponseClass::Nxdomain);
-    assert_eq!(inserted.expiry().ttl(), std::time::Duration::from_secs(20));
-    assert_eq!(hit.provenance(), Provenance::Cache);
-    #[cfg(feature = "native-api")]
-    assert_eq!(hit.cache_entry_id(), None);
-    assert!(hit.expiry().is_cacheable());
-    assert!(
-        (std::time::Duration::from_secs(19)..=std::time::Duration::from_secs(20))
-            .contains(&hit.expiry().ttl())
+    assert_eq!(first.response_class(), ResponseClass::Nxdomain);
+    assert!(!first.expiry().is_cacheable());
+    assert_eq!(first.provenance(), Provenance::Upstream);
+    assert_eq!(second.response_class(), ResponseClass::Nxdomain);
+    assert_eq!(second.provenance(), Provenance::Upstream);
+    assert_eq!(pool.calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn nodata_outcome_is_not_cached_and_requeries_upstream() {
+    let query = build_dns_query("example.com", 1);
+    let nodata = nodata_response(&query);
+    let pool = exchange([("first", Ok(nodata.clone())), ("first", Ok(nodata))], None);
+    let forwarder = DnsForwarder::new(
+        pool.clone(),
+        Arc::new(Mutex::new(DnsCache::new(8))),
+        router("first", Vec::new(), None),
     );
-    assert_eq!(pool.calls.load(Ordering::SeqCst), 1);
+
+    let first = forwarder
+        .resolve_outcome(&query)
+        .await
+        .expect("nodata miss");
+    let second = forwarder
+        .resolve_outcome(&query)
+        .await
+        .expect("nodata requery");
+
+    assert_eq!(first.response_class(), ResponseClass::Nodata);
+    assert!(!first.expiry().is_cacheable());
+    assert_eq!(first.provenance(), Provenance::Upstream);
+    assert_eq!(second.response_class(), ResponseClass::Nodata);
+    assert_eq!(second.provenance(), Provenance::Upstream);
+    assert_eq!(pool.calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn servfail_outcome_is_not_cached_and_requeries_upstream() {
+    let query = build_dns_query("example.com", 1);
+    let mut servfail = nodata_response(&query);
+    servfail[3] = 0x82;
+    let pool = exchange(
+        [("first", Ok(servfail.clone())), ("first", Ok(servfail))],
+        None,
+    );
+    let forwarder = DnsForwarder::new(
+        pool.clone(),
+        Arc::new(Mutex::new(DnsCache::new(8))),
+        router("first", Vec::new(), None),
+    );
+
+    let first = forwarder
+        .resolve_outcome(&query)
+        .await
+        .expect("servfail miss");
+    let second = forwarder
+        .resolve_outcome(&query)
+        .await
+        .expect("servfail requery");
+
+    assert_eq!(first.response_class(), ResponseClass::Servfail);
+    assert!(!first.expiry().is_cacheable());
+    assert_eq!(first.provenance(), Provenance::Upstream);
+    assert_eq!(second.response_class(), ResponseClass::Servfail);
+    assert_eq!(second.provenance(), Provenance::Upstream);
+    assert_eq!(pool.calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn cname_only_positive_without_addresses_is_not_cached() {
+    let query = build_dns_query("example.com", 1);
+    let cname = cname_response(&query, 3600);
+    let pool = exchange([("first", Ok(cname.clone())), ("first", Ok(cname))], None);
+    let forwarder = DnsForwarder::new(
+        pool.clone(),
+        Arc::new(Mutex::new(DnsCache::new(8))),
+        router("first", Vec::new(), None),
+    );
+
+    let first = forwarder.resolve_outcome(&query).await.expect("cname miss");
+    let second = forwarder
+        .resolve_outcome(&query)
+        .await
+        .expect("cname requery");
+
+    assert_eq!(first.response_class(), ResponseClass::Positive);
+    assert!(first.answer_ips().is_empty());
+    assert!(!first.expiry().is_cacheable());
+    assert_eq!(first.provenance(), Provenance::Upstream);
+    assert_eq!(second.response_class(), ResponseClass::Positive);
+    assert_eq!(second.provenance(), Provenance::Upstream);
+    assert_eq!(pool.calls.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
