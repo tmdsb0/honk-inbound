@@ -12,11 +12,11 @@
 | `upstream { ... }` | `default: 'udp://223.5.5.5:53'` | 命名上游服务器。第一个显式 `upstream` 块会替换内置条目。 |
 | `routing { ... }` | 无规则；request fallback 为 `default`；response fallback 为 `accept` | 有序的 request 与 response 路由。 |
 | `ipversion_prefer` | 省略：`both` | `4` 选择 `preferipv4`；`6` 选择 `preferipv6`；`0` 是 dae 的无偏好，即 `both`。honk 无法解析的值保持 `both`，并输出诊断。 |
-| `optimistic_cache` | `true` | 启用正、负缓存的读取与写入。 |
-| `optimistic_cache_ttl` | `600` 秒 | 固定正应答的缓存和报文 TTL，不适用于 NODATA；`0` 保留应答 TTL。 |
+| `optimistic_cache` | `true` | 启用正缓存的读取与写入。 |
+| `optimistic_cache_ttl` | `600` 秒 | 固定正应答的缓存和报文 TTL；`0` 保留应答 TTL。 |
 | `optimistic_stale_reply_ttl` | `30` 秒 | serve-stale 正应答使用的 TTL；非零值替换每个非 OPT RR 的 TTL，`0` 保留缓存中已按策略改写的 wire TTL，而不是权威 TTL。 |
 | `max_cache_size` | `10000` | 缓存最大条目数，最大 100,000；同时决定下文的分片字节预算。 |
-| `fixed_domain_ttl { ... }` | 空 | 按域名覆盖正应答和 NODATA 的 TTL；`0` 禁止缓存所有响应码的应答，包括负应答。 |
+| `fixed_domain_ttl { ... }` | 空 | 按域名覆盖正应答的 TTL；`0` 禁止缓存该域名的应答。 |
 
 标量值占据该物理行的剩余部分，只在键后的冒号处分隔，因此裸写的 IPv6 地址和 `client_subnet: auto(9.9.9.9)` 保持完整。解析器只移除一对包围整个值的匹配引号。已开启的标量引号必须在同一行闭合，否则配置失败。
 
@@ -214,26 +214,27 @@ NXDOMAIN 和 SERVFAIL 应答直接返回，不经过应答路由，也不应用�
 | 键 | 默认值 | 行为 |
 | --- | --- | --- |
 | `optimistic_cache` | `true` | 启用缓存读取与发布。 |
-| `optimistic_cache_ttl` | `600` | 覆盖正应答的最小 TTL，用于缓存生命周期和返回的记录 TTL，不适用于 NODATA。`0` 保留应答 TTL。 |
+| `optimistic_cache_ttl` | `600` | 覆盖正应答的最小 TTL，用于缓存生命周期和返回的记录 TTL。`0` 保留应答 TTL。 |
 | `optimistic_stale_reply_ttl` | `30` 秒 | serve-stale 正应答使用此 TTL；非零值替换每个非 OPT RR 的 TTL。`0` 保留缓存中已按策略改写的 wire TTL，而不是权威 TTL；此时 outcome TTL 从该 wire 的 `extract_min_ttl` 得出，不存在正 TTL 时回退为 60 秒。非零值时，即使不存在正 TTL，outcome TTL 仍为配置值。 |
 | `max_cache_size` | `10000` | 条目上限，由最多 16 个分片分摊。每个分片的应答字节预算为 `max(条目容量 × 1 KiB, 65,535 字节)`；按 LRU 淘汰直到两个上限都满足。单条超过 65,535 字节的应答不缓存。大于 100,000 的值钳制为 100,000，`0` 钳制为一个条目，两者均会告警。 |
-| `fixed_domain_ttl { domain: seconds }` | 空 | 先于 `optimistic_cache_ttl` 应用的按域名覆盖；`0` 禁止缓存所有响应码的应答，包括 NXDOMAIN 和 SERVFAIL。 |
+| `fixed_domain_ttl { domain: seconds }` | 空 | 先于 `optimistic_cache_ttl` 应用的按域名覆盖；`0` 禁止缓存该域名的应答。 |
 
 Request 路由先于缓存查询执行。缓存与后台刷新的标识使用选中的上游或精确 `asis` 目的地址，不使用原始客户端来源：选择相同交换 scope 的客户端共享条目，选择不同上游或 `asis` 目的地址的客户端仍相互隔离。偏好地址族的渲染继续保留来源元数据，因此依赖来源的 sibling 策略不会经 foreground singleflight 泄漏。
 
-设置 `optimistic_cache_ttl: 0` 且没有 `fixed_domain_ttl` 覆盖时，NOERROR 正应答使用 answer、authority 和 additional 段中所有非 OPT 记录的最小 TTL。任一记录 TTL 为零时，honk 不缓存该应答，并移除精确缓存槽，避免旧地址或更早的负应答再次返回。非零的配置 TTL 或固定 TTL 仍可覆盖零值。其他失败响应码的 TTL 行为不变。
+设置 `optimistic_cache_ttl: 0` 且没有 `fixed_domain_ttl` 覆盖时，NOERROR 正应答使用 answer、authority 和 additional 段中所有非 OPT 记录的最小 TTL。任一记录 TTL 为零时，honk 不缓存该应答，并移除精确缓存槽，避免旧地址再次返回。非零的配置 TTL 或固定 TTL 仍可覆盖零值。失败响应码（NXDOMAIN、SERVFAIL、NODATA）永不缓存。
 
 不保留缓存不等于禁用 DNS 路由投影。已接受但不可缓存的正应答（包括 `fixed_domain_ttl: 0`）使用 wire 中非 OPT 记录的最小正 TTL 作为投影寿命；这些 TTL 全为零时回退为 60 秒。此规则不会改写应答，也不会使其变得可缓存；缓存命中的剩余寿命与 served-stale 寿命保持不变。
 
 ### 负应答
 
-NXDOMAIN 的缓存时间为 `min(SOA TTL, SOA MINIMUM, 300)` 秒。缺少 SOA 或 SOA 生命周期为零时不缓存，并移除精确缓存键下已有的正、负缓存，避免旧地址再次作为过期应答返回。前台结果替换当时已有的发布结果；后台刷新只移除开始时读取的版本。`fixed_domain_ttl: 0` 禁止缓存，但不移除已有条目。除此之外，SERVFAIL 仍使用 SOA 得出的生命周期，缺省为 60 秒，并限制在 `1..=300` 秒。
+只有成功解析且返回至少一个地址的应答才会缓存。NXDOMAIN、SERVFAIL 和
+NODATA 永不写入缓存：一次失败的查询不触动缓存，下次查询会重新向上游查询，
+而之前缓存的好应答会继续生效，直到其自身的 TTL 到期。不带地址的正应答
+（例如仅含 CNAME 的应答）同样不缓存。
 
-此处 NODATA 指没有 answer 记录的 NOERROR 应答（`ANCOUNT=0`）；answer 非空时仍归为正应答，包括仅含 CNAME/DNAME 的应答。NODATA 的完整报文保留在正缓存槽中，生命周期为 `min(SOA TTL, SOA MINIMUM, 300)` 秒。非零 `fixed_domain_ttl` 优先于 SOA 和上限，即使缺少 SOA 也生效。没有该覆盖值时，缺少 SOA 或生命周期为零的 NODATA 与 NXDOMAIN 一样：移除精确缓存槽，不保留新应答。
+此处 NODATA 指没有 answer 记录的 NOERROR 应答（`ANCOUNT=0`）；answer 非空时仍归为正应答，包括仅含 CNAME/DNAME 的应答。
 
-缓存的 NODATA 仍可作为过期应答返回；过期应答改写的是 SOA 记录 TTL，而不是 SOA MINIMUM。对上游 NODATA 应用响应策略 `reject` 会生成空的 NOERROR 报文；其缓存生命周期按相同的 TTL 规则计算，使用被拒绝应答的 SOA，而非合成报文。后续请求会在该生命周期内复用合成应答。
-
-即使响应策略 `reject` 将回复替换为合成的 NOERROR，缓存生命周期仍按原始上游应答的分类、响应码和 TTL 选择。被拒绝的 REFUSED 因此保留失败响应码的 TTL 规则；没有配置 TTL 或固定 TTL 覆盖时，被拒绝的 NOERROR 正应答使用原始 TTL。
+响应策略 `reject` 会把回复替换为空的 NOERROR 报文交给调用方，但该替代报文永不缓存；下次查询会重新向上游查询。
 
 缓存命中时不会递减报文中的记录 TTL。替换只影响内存，不删除已保存的持久化行。
 
