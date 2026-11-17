@@ -75,7 +75,9 @@ pub trait TcpOutbound: Send + Sync {
     /// connection over the detour, which only the protocols that dial through
     /// the shared transport do; dialling regardless would send the flow out of
     /// the real interface while looking like an ordinary connection, which is
-    /// the one outcome a detour exists to rule out.
+    /// the one outcome a detour exists to rule out. QUIC outbounds (Hysteria2,
+    /// TUIC, Juicity) share the `crate::quic::fronted_quic_dial!` template so
+    /// none of them can accidentally reuse a cached client from another path.
     async fn dial_runtime_detoured(
         &self,
         _runtime: Arc<crate::runtime::NodeRuntime>,

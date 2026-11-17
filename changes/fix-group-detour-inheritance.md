@@ -1,4 +1,0 @@
-Fixed
-
-- A group that draws its members from another group with `filter: group(X)` now inherits X's `detour:` when it names none of its own. Previously a group detour was looked up only on the group the flow hit, so every group referring to a chained group — `Proxy`, `Google`, `YouTube` and the rest in a typical split-routing config — used the same node as `Final` but dialled it directly, bypassing the front. `filter: group(X)` is a reference edge rather than a copied node list, so borrowing X's selection now also borrows how that selection leaves the machine.
-- An explicit `detour:`, including `direct`, still wins; inheritance follows nested groups in declaration order and cannot loop. Because the lookup lives in `group_detour()`, TCP and UDP dials and the Clash/native delay probes all take the same front.

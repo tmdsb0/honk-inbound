@@ -120,13 +120,14 @@ async fn test_prefer_ipv4_returns_aaaa_when_no_a() {
         "AAAA + sibling A probe"
     );
 
-    // Cache-hit path: AAAA and the sibling's NODATA are both cached.
+    // Cache-hit path: the AAAA answer is cached, but the sibling's NODATA
+    // is not, so the second resolve re-probes the sibling upstream.
     let resp2 = forwarder
         .resolve(&build_dns_query("example.com", 28))
         .await
         .unwrap();
     assert_eq!(answer_count(&resp2), 1);
-    assert_eq!(mock.call_count.load(Ordering::SeqCst), 2);
+    assert_eq!(mock.call_count.load(Ordering::SeqCst), 3);
 }
 
 #[tokio::test]
@@ -171,52 +172,6 @@ async fn cached_prefer_expiry_excludes_sibling_wait() {
     assert!(
         outcome.expiry().ttl() <= remaining_after_wait,
         "cache-hit expiry {:?} includes the sibling wait; remaining afterward is {remaining_after_wait:?}",
-        outcome.expiry().ttl(),
-    );
-    assert_eq!(upstream.call_count.load(Ordering::SeqCst), 1);
-}
-
-#[tokio::test]
-async fn cached_negative_prefer_expiry_excludes_sibling_wait() {
-    use crate::dns::cache::{CacheKey, OperationKind};
-    use crate::dns::planner::{RequestScope, UpstreamTag};
-    use crate::dns::query::QueryContext;
-
-    let query = build_dns_query("example.com", 28);
-    let upstream = Arc::new(GatedUpstream {
-        response: nodata_response("example.com", 1, None),
-        call_count: AtomicUsize::new(0),
-        entered: tokio::sync::Notify::new(),
-        release: tokio::sync::Notify::new(),
-    });
-    let forwarder = DnsForwarder::new(upstream.clone(), test_cache(), test_router())
-        .with_strategy(DnsStrategy::PreferIpv4);
-    let key = CacheKey::new(
-        &QueryContext::parse(&query).expect("query"),
-        None,
-        RequestScope::Upstream(UpstreamTag::new("default").expect("scope")),
-        OperationKind::Resolve,
-    );
-    let cache = forwarder.cache_service().await;
-    cache.put_negative_exact(key.clone(), 300, 3);
-
-    let (outcome, remaining_after_wait) = tokio::join!(forwarder.resolve_outcome(&query), async {
-        upstream.entered.notified().await;
-        // Negative hits round up to whole seconds; cross that rounding boundary.
-        tokio::time::sleep(Duration::from_millis(1100)).await;
-        let hit = cache
-            .negative_hit_exact(&key)
-            .expect("negative cache entry");
-        upstream.release.notify_one();
-        hit.remaining_ttl
-    });
-    let outcome = outcome.expect("cached non-preferred negative answer");
-    assert_eq!(outcome.provenance(), Provenance::Cache);
-    assert_eq!(outcome.response_class(), ResponseClass::Nxdomain);
-    assert!(outcome.expiry().is_cacheable());
-    assert!(
-        outcome.expiry().ttl() <= remaining_after_wait,
-        "negative cache-hit expiry {:?} includes the sibling wait; remaining afterward is {remaining_after_wait:?}",
         outcome.expiry().ttl(),
     );
     assert_eq!(upstream.call_count.load(Ordering::SeqCst), 1);
@@ -346,10 +301,11 @@ async fn preferred_family_packet_rejection_is_terminal_but_offline_falls_back() 
     }
 }
 
-/// A cached NXDOMAIN must be answered as NXDOMAIN (rcode 3), never
-/// upgraded to SERVFAIL — the two have opposite client semantics.
+/// An NXDOMAIN must be answered as NXDOMAIN (rcode 3), never upgraded to
+/// SERVFAIL — the two have opposite client semantics — and it is not cached,
+/// so the second query re-asks upstream.
 #[tokio::test]
-async fn test_negative_cache_returns_nxdomain_not_servfail() {
+async fn nxdomain_is_not_cached_and_keeps_rcode() {
     let query = make_a_query();
     let nx = make_nxdomain_response(&query, 30, 20);
     let mock = Arc::new(MockUpstream::new(nx));
@@ -360,13 +316,13 @@ async fn test_negative_cache_returns_nxdomain_not_servfail() {
     assert_eq!(resp[3] & 0x0f, 3);
     assert_eq!(mock.call_count.load(Ordering::SeqCst), 1);
 
-    let resp2 = forwarder.resolve(&query).await.expect("cached nxdomain");
-    assert_eq!(resp2[3] & 0x0f, 3, "cached negative must stay NXDOMAIN");
+    let resp2 = forwarder.resolve(&query).await.expect("second nxdomain");
+    assert_eq!(resp2[3] & 0x0f, 3, "second negative must stay NXDOMAIN");
     assert_eq!(resp2[0..2], query[0..2], "txid must match the query");
     assert_eq!(
         mock.call_count.load(Ordering::SeqCst),
-        1,
-        "negative hit must not re-query upstream"
+        2,
+        "nxdomain is not cached, so the second query re-asks upstream"
     );
 }
 
@@ -427,6 +383,52 @@ async fn cache_disabled_nxdomain_preserves_shared_positive() {
     assert_eq!(positive.call_count.load(Ordering::SeqCst), 1);
 }
 
+/// An NXDOMAIN under a different upstream scope does not disturb a shared
+/// positive: the failure is not cached, so the positive keeps serving.
+#[tokio::test]
+async fn nxdomain_in_other_scope_leaves_shared_positive() {
+    let query = make_a_query();
+    let cache = test_cache();
+    let positive = Arc::new(MockUpstream::new(make_a_response([192, 0, 2, 1], 600)));
+    let negative = Arc::new(MockUpstream::new(make_nxdomain_response(&query, 30, 20)));
+    let cached = DnsForwarder::new(positive.clone(), cache.clone(), test_router());
+    // A different fallback upstream gives the NXDOMAIN its own cache scope,
+    // so the second forwarder actually reaches its upstream instead of
+    // hitting the shared positive.
+    let other_router = Arc::new(
+        DnsRouter::new(&DnsRouting {
+            rules: vec![],
+            fallback: "other".into(),
+            ..Default::default()
+        })
+        .expect("other router"),
+    );
+    let other = DnsForwarder::new(negative, cache, other_router);
+
+    let initial = cached.resolve_outcome(&query).await.unwrap();
+    let outcome = other.resolve_outcome(&query).await.unwrap();
+    assert_eq!(outcome.response_class(), ResponseClass::Nxdomain);
+    let retained = cached.resolve_outcome(&query).await.unwrap();
+    assert_eq!(retained.provenance(), Provenance::Cache);
+    assert_eq!(retained.answer_ips(), initial.answer_ips());
+    assert_eq!(positive.call_count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn cname_only_answer_is_not_cached() {
+    let query = make_a_query();
+    let upstream = Arc::new(MockUpstream::new(make_cname_only_response(300)));
+    let forwarder =
+        DnsForwarder::new(upstream.clone(), test_cache(), test_router()).with_cache_ttl(600);
+    let first = forwarder.resolve_outcome(&query).await.unwrap();
+    assert_eq!(first.response_class(), ResponseClass::Positive);
+    assert!(first.answer_ips().is_empty());
+    assert!(!first.expiry().is_cacheable());
+    let second = forwarder.resolve_outcome(&query).await.unwrap();
+    assert_eq!(second.provenance(), Provenance::Upstream);
+    assert_eq!(upstream.call_count.load(Ordering::SeqCst), 2);
+}
+
 #[tokio::test]
 async fn cache_disabled_zero_ttl_positive_preserves_shared_positive() {
     let query = make_a_query();
@@ -451,9 +453,10 @@ async fn cache_disabled_zero_ttl_positive_preserves_shared_positive() {
     assert_eq!(positive.call_count.load(Ordering::SeqCst), 1);
 }
 
-/// A cached SERVFAIL stays SERVFAIL (rcode 2) on later hits.
+/// A SERVFAIL stays SERVFAIL (rcode 2) on later queries, which re-ask
+/// upstream because failures are not cached.
 #[tokio::test]
-async fn test_negative_cache_keeps_servfail_rcode() {
+async fn servfail_is_not_cached_and_keeps_rcode() {
     let mut sf = make_a_response([93, 184, 216, 34], 1);
     sf[3] = 0x82; // QR + RA + SERVFAIL
     let mock = Arc::new(MockUpstream::new(sf));
@@ -462,14 +465,14 @@ async fn test_negative_cache_keeps_servfail_rcode() {
     let query = make_a_query();
 
     let _ = forwarder.resolve(&query).await;
-    // Second hit: still rcode 2, no extra upstream call.
-    let resp2 = forwarder.resolve(&query).await.expect("cached servfail");
+    // Second query: still rcode 2, re-asked upstream.
+    let resp2 = forwarder.resolve(&query).await.expect("second servfail");
     assert_eq!(resp2[3] & 0x0f, 2);
-    assert_eq!(mock.call_count.load(Ordering::SeqCst), 1);
+    assert_eq!(mock.call_count.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
-async fn cached_negative_keeps_source_aware_preferred_family_projection() {
+async fn negative_response_keeps_source_aware_preferred_family_projection() {
     use honk_config::dns::{DnsCond, DnsRequestAction, DnsRequestRouting, DnsRequestRule};
 
     struct NegativePreferenceUpstream {
@@ -557,7 +560,14 @@ async fn cached_negative_keeps_source_aware_preferred_family_projection() {
         }
         let mut calls = upstream.calls.lock().expect("calls").clone();
         calls.sort();
-        assert_eq!(calls, ["has-a", "negative", "no-a"]);
+        // The positive A answer is cached (one "has-a" call), but the
+        // negative AAAA answers and the NODATA A probes are not.
+        assert_eq!(
+            calls,
+            [
+                "has-a", "negative", "negative", "negative", "negative", "no-a", "no-a"
+            ]
+        );
     }
 }
 
@@ -686,18 +696,18 @@ async fn preferred_family_sibling_keeps_client_source_routing() {
 }
 
 #[tokio::test]
-async fn nodata_soa_lifetime_uses_minimum_and_cap_not_optimistic_ttl() {
+async fn nodata_is_not_cached() {
     let query = make_a_query();
-    for (ttl, minimum, expected) in [(30, 20, 20), (600, 600, 300)] {
+    for (ttl, minimum) in [(30, 20), (600, 600)] {
         let response = nodata_response("example.com", 1, Some((ttl, minimum)));
         let upstream = Arc::new(MockUpstream::new(response));
         let forwarder =
             DnsForwarder::new(upstream.clone(), test_cache(), test_router()).with_cache_ttl(600);
         let first = forwarder.resolve_outcome(&query).await.unwrap();
-        assert_eq!(first.expiry().ttl(), Duration::from_secs(expected));
-        let cached = forwarder.resolve_outcome(&query).await.unwrap();
-        assert_eq!(cached.provenance(), Provenance::Cache);
-        assert_eq!(upstream.call_count.load(Ordering::SeqCst), 1);
+        assert!(!first.expiry().is_cacheable());
+        let second = forwarder.resolve_outcome(&query).await.unwrap();
+        assert_eq!(second.provenance(), Provenance::Upstream);
+        assert_eq!(upstream.call_count.load(Ordering::SeqCst), 2);
     }
 }
 
@@ -717,7 +727,7 @@ async fn nodata_without_soa_or_zero_soa_ttl_is_not_cached() {
 }
 
 #[tokio::test]
-async fn nodata_fixed_ttl_overrides_missing_soa_and_negative_cap() {
+async fn nodata_fixed_ttl_does_not_make_nodata_cacheable() {
     let query = make_a_query();
     let upstream = Arc::new(MockUpstream::new(nodata_response("example.com", 1, None)));
     let fixed_ttl = std::collections::HashMap::from([("example.com".to_owned(), 3600)]);
@@ -726,14 +736,14 @@ async fn nodata_fixed_ttl_overrides_missing_soa_and_negative_cap() {
     );
     let forwarder = DnsForwarder::new(upstream.clone(), test_cache(), router).with_cache_ttl(600);
     let first = forwarder.resolve_outcome(&query).await.unwrap();
-    assert_eq!(first.expiry().ttl(), Duration::from_secs(3600));
-    let cached = forwarder.resolve_outcome(&query).await.unwrap();
-    assert_eq!(cached.provenance(), Provenance::Cache);
-    assert_eq!(upstream.call_count.load(Ordering::SeqCst), 1);
+    assert!(!first.expiry().is_cacheable());
+    let second = forwarder.resolve_outcome(&query).await.unwrap();
+    assert_eq!(second.provenance(), Provenance::Upstream);
+    assert_eq!(upstream.call_count.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
-async fn nodata_response_policy_reject_caches_synthetic_for_rejected_soa_lifetime() {
+async fn rejected_responses_are_not_cached() {
     use honk_config::dns::{DnsResponseAction, DnsResponseRouting};
 
     let query = make_a_query();
@@ -757,13 +767,12 @@ async fn nodata_response_policy_reject_caches_synthetic_for_rejected_soa_lifetim
     .with_cache_ttl(600);
     let first = forwarder.resolve_outcome(&query).await.unwrap();
     assert_eq!(first.status(), OutcomeStatus::Rejected);
-    assert_eq!(first.expiry().ttl(), Duration::from_secs(20));
+    assert!(!first.expiry().is_cacheable());
     assert_eq!(first.reusable().len(), query.len());
     assert_eq!(first.reusable()[3] & 0x0f, 0);
-    let cached = forwarder.resolve_outcome(&query).await.unwrap();
-    assert_eq!(cached.provenance(), Provenance::Cache);
-    assert_eq!(cached.reusable(), first.reusable());
-    assert_eq!(upstream.call_count.load(Ordering::SeqCst), 1);
+    let second = forwarder.resolve_outcome(&query).await.unwrap();
+    assert_eq!(second.provenance(), Provenance::Upstream);
+    assert_eq!(upstream.call_count.load(Ordering::SeqCst), 2);
 
     let positive = Arc::new(MockUpstream::new(make_a_response([192, 0, 2, 1], 30)));
     let positive_router = Arc::new(DnsRouter::new(&routing).unwrap());
@@ -771,15 +780,14 @@ async fn nodata_response_policy_reject_caches_synthetic_for_rejected_soa_lifetim
         DnsForwarder::new(positive.clone(), test_cache(), positive_router).with_cache_ttl(600);
     let rejected = positive_forwarder.resolve_outcome(&query).await.unwrap();
     assert_eq!(rejected.status(), OutcomeStatus::Rejected);
-    assert_eq!(rejected.expiry().ttl(), Duration::from_secs(600));
-    let cached = positive_forwarder.resolve_outcome(&query).await.unwrap();
-    assert_eq!(cached.provenance(), Provenance::Cache);
-    assert_eq!(cached.reusable(), rejected.reusable());
-    assert_eq!(positive.call_count.load(Ordering::SeqCst), 1);
+    assert!(!rejected.expiry().is_cacheable());
+    let second = positive_forwarder.resolve_outcome(&query).await.unwrap();
+    assert_eq!(second.provenance(), Provenance::Upstream);
+    assert_eq!(positive.call_count.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
-async fn empty_refused_response_keeps_optimistic_cache_lifetime() {
+async fn empty_refused_response_is_not_cached() {
     let query = make_a_query();
     let mut response = query.clone();
     response[2] = 0x81;
@@ -788,12 +796,12 @@ async fn empty_refused_response_keeps_optimistic_cache_lifetime() {
     let forwarder =
         DnsForwarder::new(upstream.clone(), test_cache(), test_router()).with_cache_ttl(600);
     let first = forwarder.resolve_outcome(&query).await.unwrap();
-    assert_eq!(first.expiry().ttl(), Duration::from_secs(600));
+    assert!(!first.expiry().is_cacheable());
     assert_eq!(first.rendered()[3] & 0x0f, 5);
-    let cached = forwarder.resolve_outcome(&query).await.unwrap();
-    assert_eq!(cached.provenance(), Provenance::Cache);
-    assert_eq!(cached.rendered()[3] & 0x0f, 5);
-    assert_eq!(upstream.call_count.load(Ordering::SeqCst), 1);
+    let second = forwarder.resolve_outcome(&query).await.unwrap();
+    assert_eq!(second.provenance(), Provenance::Upstream);
+    assert_eq!(second.rendered()[3] & 0x0f, 5);
+    assert_eq!(upstream.call_count.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
@@ -817,7 +825,7 @@ async fn zero_ttl_answer_is_not_cached_when_upstream_ttls_are_kept() {
 }
 
 #[tokio::test]
-async fn refused_zero_ttl_answer_keeps_legacy_cache_lifetime() {
+async fn refused_answer_is_not_cached() {
     let query = make_a_query();
     let mut refused = make_a_response([192, 0, 2, 1], 0);
     refused[3] = 0x85;
@@ -827,11 +835,11 @@ async fn refused_zero_ttl_answer_keeps_legacy_cache_lifetime() {
 
     let first = forwarder.resolve_outcome(&query).await.expect("first");
     assert_eq!(first.rendered()[3] & 0x0f, 5);
-    assert_eq!(first.expiry().ttl(), Duration::from_secs(60));
-    let second = forwarder.resolve_outcome(&query).await.expect("cached");
+    assert!(!first.expiry().is_cacheable());
+    let second = forwarder.resolve_outcome(&query).await.expect("second");
     assert_eq!(second.rendered()[3] & 0x0f, 5);
-    assert_eq!(second.provenance(), Provenance::Cache);
-    assert_eq!(upstream.call_count.load(Ordering::SeqCst), 1);
+    assert_eq!(second.provenance(), Provenance::Upstream);
+    assert_eq!(upstream.call_count.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
@@ -861,7 +869,7 @@ async fn zero_ttl_root_null_additional_record_prevents_whole_wire_reuse() {
 }
 
 #[tokio::test]
-async fn rejected_failure_responses_keep_failure_cache_lifetimes() {
+async fn rejected_failure_responses_are_not_cached() {
     use honk_config::dns::{DnsResponseAction, DnsResponseRouting};
 
     let query = make_a_query();
@@ -872,9 +880,9 @@ async fn rejected_failure_responses_keep_failure_cache_lifetimes() {
         },
         ..Default::default()
     };
-    for (mut response, configured_ttl, expected_ttl) in [
-        (nodata_response("example.com", 1, None), 600, 600),
-        (make_a_response([192, 0, 2, 1], 0), 0, 60),
+    for (mut response, configured_ttl) in [
+        (nodata_response("example.com", 1, None), 600),
+        (make_a_response([192, 0, 2, 1], 0), 0),
     ] {
         response[3] = 0x85;
         let upstream = Arc::new(MockUpstream::new(response));
@@ -890,16 +898,15 @@ async fn rejected_failure_responses_keep_failure_cache_lifetimes() {
             .await
             .expect("rejected failure");
         assert_eq!(first.status(), OutcomeStatus::Rejected);
-        assert_eq!(first.expiry().ttl(), Duration::from_secs(expected_ttl));
+        assert!(!first.expiry().is_cacheable());
         assert_eq!(first.rendered()[3] & 0x0f, 0);
         assert_eq!(answer_count(first.rendered()), 0);
 
-        let cached = forwarder
+        let second = forwarder
             .resolve_outcome(&query)
             .await
-            .expect("cached rejection");
-        assert_eq!(cached.provenance(), Provenance::Cache);
-        assert_eq!(cached.reusable(), first.reusable());
-        assert_eq!(upstream.call_count.load(Ordering::SeqCst), 1);
+            .expect("second rejection");
+        assert_eq!(second.provenance(), Provenance::Upstream);
+        assert_eq!(upstream.call_count.load(Ordering::SeqCst), 2);
     }
 }

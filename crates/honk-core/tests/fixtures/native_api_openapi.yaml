@@ -365,7 +365,6 @@ paths:
                         flush: true
                         entry_kinds:
                           - positive
-                          - negative
                       dns_log:
                         available: true
                         min_records: 64
@@ -5976,7 +5975,6 @@ paths:
                     observed_at: '2026-08-15T12:00:00Z'
                     coverage:
                       positive: true
-                      negative: true
                       persistent: false
                     entries:
                       - entry_id: dns-entry-01HZX4K8W5
@@ -5992,14 +5990,6 @@ paths:
                             ttl: 3600
                         expires_at: '2026-08-15T13:00:00Z'
                         stale_until: null
-                      - entry_id: dns-entry-01HZX4K8W6
-                        domain: missing.example.com.
-                        type: A
-                        class: IN
-                        status: NXDOMAIN
-                        answers: []
-                        expires_at: '2026-08-15T12:05:00Z'
-                        stale_until: '2026-08-15T12:06:00Z'
                     total: 1024
                     next_cursor: eyJvZmZzZXQiOjEwMH0
                     usage:
@@ -8200,7 +8190,6 @@ components:
                     type: string
                     enum:
                       - positive
-                      - negative
             dns_log:
               type: object
               required:
@@ -12862,12 +12851,9 @@ components:
       type: object
       required:
         - positive
-        - negative
         - persistent
       properties:
         positive:
-          type: boolean
-        negative:
           type: boolean
         persistent:
           type: boolean

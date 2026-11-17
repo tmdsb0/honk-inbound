@@ -1021,8 +1021,12 @@ async fn udp_carrier_close_is_node_failure() {
         )
         .await
         .unwrap();
-    let endpoint =
-        crate::quic::packet_transport_endpoint(transport.clone(), transport.relay_addr()).unwrap();
+    let endpoint = crate::quic::packet_transport_endpoint_with_mtu(
+        transport.clone(),
+        transport.relay_addr(),
+        1252,
+    )
+    .unwrap();
     let (conn, _) = client.connection(timeout).await.unwrap();
     conn.close(quinn::VarInt::from_u32(0), b"carrier closed");
     let error = transport.send_packet(b"query").await.unwrap_err();
@@ -1562,12 +1566,14 @@ fn test_hop_state_rotation() {
 
 mod source_udp;
 
-/// Salamander wraps the datagrams on this client's own socket and port hopping
-/// rotates their destination. A detour owns that socket, so the two cannot be
-/// combined: refusing is better than sending plain QUIC while the configuration
-/// says it is obfuscated.
+/// Salamander is a datagram transform, so on a fronted path it is applied to
+/// the detour's framed UDP transport instead of a socket. Port hopping rotates
+/// the destination port, and a detour's transport is pinned to the one target
+/// it was dialled for, so that one still needs a socket of its own: refusing
+/// is better than sending plain QUIC while the configuration says it is
+/// hopping.
 #[tokio::test]
-async fn obfs_cannot_ride_a_detour() {
+async fn obfs_rides_a_detour_but_port_hopping_cannot() {
     let mut node = test_node(1, TEST_PASSWORD);
     node.hysteria2_mut().unwrap().obfs = Some("obfs-secret".to_string());
     let generation =
@@ -1577,13 +1583,18 @@ async fn obfs_cannot_ride_a_detour() {
         generation,
         uuid::Uuid::new_v4(),
     ));
+    Hysteria2Handler::new()
+        .build_client(&node, None, Some(&path))
+        .await
+        .expect("obfs rides a detour through its framed transport");
+    node.hysteria2_mut().unwrap().port_hopping = Some("8080".to_string());
     let error = Hysteria2Handler::new()
         .build_client(&node, None, Some(&path))
         .await
         // `Result::expect_err` would demand `Debug` on the client, which is
         // never worth deriving for a live socket holder.
         .err()
-        .expect("obfs and a detour cannot both apply")
+        .expect("port hopping and a detour cannot both apply")
         .to_string();
     assert!(error.contains("cannot ride a detour"), "{error}");
     assert!(error.contains(&node.name), "{error}");

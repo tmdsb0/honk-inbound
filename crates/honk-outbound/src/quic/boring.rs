@@ -25,8 +25,8 @@ use boring::aead::{AeadCtx, Algorithm as AeadAlgorithm};
 use boring::error::ErrorStack;
 use boring::pkey::{PKey, Public};
 use boring::ssl::{
-    Ssl, SslAlert, SslContext, SslContextBuilder, SslMethod, SslRef, SslVerifyError,
-    SslVerifyMode, SslVersion,
+    Ssl, SslAlert, SslContext, SslContextBuilder, SslMethod, SslRef, SslVerifyError, SslVerifyMode,
+    SslVersion,
 };
 use bytes::BytesMut;
 use foreign_types::ForeignTypeRef;
@@ -610,9 +610,7 @@ impl BoringQuicClientConfig {
                 builder.set_private_key(&key)?;
             }
             (None, None) => {}
-            _ => anyhow::bail!(
-                "QUIC client identity needs both a certificate and a private key"
-            ),
+            _ => anyhow::bail!("QUIC client identity needs both a certificate and a private key"),
         }
 
         let has_endpoint_pin = endpoint_public_key.is_some();
@@ -620,10 +618,8 @@ impl BoringQuicClientConfig {
             // The SNI is a decoy (www.microsoft.com in the wild), so PKI and
             // hostname verification would always fail. Pin the leaf's public
             // key exactly as the TCP WARP carrier does.
-            builder.set_custom_verify_callback(
-                SslVerifyMode::PEER,
-                pin_endpoint_public_key(pinned),
-            );
+            builder
+                .set_custom_verify_callback(SslVerifyMode::PEER, pin_endpoint_public_key(pinned));
         } else if let Some(pin) = pin_sha256 {
             // pinSHA256: fingerprint check replaces PKI + hostname checks.
             builder.set_custom_verify_callback(

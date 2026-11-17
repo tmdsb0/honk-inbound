@@ -1,6 +1,6 @@
 //! Sharded, bounded DNS response cache with exact query identities.
 //!
-//! Positive and negative entries are isolated by canonical query wire,
+//! Positive entries are isolated by canonical query wire,
 //! ingress profile, logical scope, policy, and operation. Expired positives
 //! remain available only within the bounded serve-stale window.
 
@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::{Mutex as StdMutex, MutexGuard};
 
 mod compatibility {
-    use super::{CachedEntry, DnsCache, NegativeCacheHit};
+    use super::{CachedEntry, DnsCache};
 
     impl DnsCache {
         pub fn get(&mut self, key: &str) -> Option<CachedEntry> {
@@ -37,26 +37,6 @@ mod compatibility {
         ) {
             self.service
                 .insert_beyond_stale_retention_for_test(key, response, ttl);
-        }
-
-        pub fn put_negative(&mut self, key: String, ttl: u32, rcode: u8) {
-            self.service.put_negative(key, ttl, rcode);
-        }
-
-        pub fn negative_rcode(&self, key: &str) -> Option<u8> {
-            self.service.negative_rcode(key)
-        }
-
-        pub fn negative_hit(&self, key: &str) -> Option<NegativeCacheHit> {
-            self.service.negative_hit(key)
-        }
-
-        pub fn clear_negative(&mut self, key: &str) {
-            self.service.clear_negative(key);
-        }
-
-        pub fn purge_expired_negatives(&mut self) {
-            self.service.purge_expired_negatives();
         }
 
         pub fn clear(&mut self) {
@@ -159,35 +139,9 @@ mod counters {
 mod control;
 mod key;
 mod maintenance {
-    use std::time::Instant;
-
     use super::{CacheSlot, CachedEntry, DnsCacheService, lock};
 
     impl DnsCacheService {
-        pub fn clear_negative(&self, key: &str) {
-            let key = CacheSlot::Legacy(key.to_owned());
-            let index = self.shard_index(&key);
-            let mut shard = lock(&self.shards[index]);
-            shard.drop_negative(&key);
-        }
-
-        pub fn purge_expired_negatives(&self) {
-            let now = Instant::now();
-            for shard in &self.shards {
-                let mut shard = lock(shard);
-                let expired: Vec<CacheSlot> = shard
-                    .iter()
-                    .filter(|(_, value)| {
-                        value.negative.is_some_and(|entry| now >= entry.expires_at)
-                    })
-                    .map(|(key, _)| key.clone())
-                    .collect();
-                for key in expired {
-                    shard.drop_negative(&key);
-                }
-            }
-        }
-
         pub fn clear(&self) {
             for shard in &self.shards {
                 lock(shard).clear();
@@ -208,7 +162,6 @@ mod maintenance {
                     shard.drop_positive(&key);
                 }
             }
-            self.purge_expired_negatives();
         }
 
         pub fn remove(&self, key: &str) -> Option<CachedEntry> {
@@ -287,21 +240,8 @@ mod storage {
         pub(crate) strict_reusable: bool,
     }
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub struct NegativeCacheHit {
-        pub rcode: u8,
-        pub remaining_ttl: Duration,
-    }
-
-    #[derive(Debug, Clone, Copy)]
-    pub(super) struct NegativeEntry {
-        pub expires_at: Instant,
-        pub rcode: u8,
-    }
-
     pub(super) struct CacheValue {
         pub positive: Option<CachedEntry>,
-        pub negative: Option<NegativeEntry>,
         pub revision: u64,
     }
 
@@ -309,15 +249,6 @@ mod storage {
         pub(super) fn positive(entry: CachedEntry, revision: u64) -> Self {
             Self {
                 positive: Some(entry),
-                negative: None,
-                revision,
-            }
-        }
-
-        pub(super) fn negative(entry: NegativeEntry, revision: u64) -> Self {
-            Self {
-                positive: None,
-                negative: Some(entry),
                 revision,
             }
         }
@@ -369,10 +300,10 @@ pub use counters::CacheCounters;
 pub(crate) use key::{CacheKey, KeyIdentity, OperationKind};
 pub(crate) use service::PublicationEpoch;
 pub(crate) use service::{CacheSlot, DnsCacheService};
-pub use storage::{CachedEntry, NegativeCacheHit};
+pub use storage::CachedEntry;
 pub(crate) use store::ExactLookup;
 
-use storage::{CacheValue, NegativeEntry};
+use storage::CacheValue;
 
 /// DNS response cache with LRU eviction and TTL-based expiry.
 ///
@@ -381,9 +312,6 @@ use storage::{CacheValue, NegativeEntry};
 /// at lookup time; expired entries are not returned by [`DnsCache::get`]
 /// but remain available via [`DnsCache::get_stale`] for one hour
 /// (serve-stale, RFC 8767) before being dropped.
-///
-/// Also maintains a negative cache for NXDOMAIN/SERVFAIL responses
-/// to avoid repeated upstream queries for known-bad domains.
 ///
 /// When a [`DnsCachePersister`](super::persist::DnsCachePersister) is
 /// installed (`cache_file.store_dns`), every positive `put` is mirrored to

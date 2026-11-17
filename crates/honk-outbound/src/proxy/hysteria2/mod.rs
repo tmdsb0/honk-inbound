@@ -220,6 +220,21 @@ impl Hy2ConnState {
 const MAX_TCP_RESPONSE_BUFFER: usize =
     1 + 8 + MAX_MESSAGE_LENGTH as usize + 8 + MAX_PADDING_LENGTH as usize;
 
+/// Opaque keepalive for the client that opened a stream's QUIC connection.
+///
+/// A detoured dial builds a one-off client whose `State` owns the packet
+/// endpoint and its adapter workers. Without a claim from the stream, that
+/// client is dropped as soon as `dial_runtime_detoured` returns, tearing down
+/// the endpoint while the stream is still doing I/O.
+#[derive(Clone)]
+struct ClientKeepalive(#[allow(dead_code)] Arc<Hy2Client>);
+
+impl std::fmt::Debug for ClientKeepalive {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ClientKeepalive")
+    }
+}
+
 #[derive(Debug)]
 struct Hy2TcpStream {
     inner: crate::quic::QuicBiStream,
@@ -227,16 +242,18 @@ struct Hy2TcpStream {
     response: Vec<u8>,
     body_offset: Option<usize>,
     observer: Option<crate::runtime::flow_observation::FlowObserver>,
+    _client: Option<ClientKeepalive>,
 }
 
 impl Hy2TcpStream {
-    fn new(inner: crate::quic::QuicBiStream, addr: &str) -> Self {
+    fn new(inner: crate::quic::QuicBiStream, addr: &str, client: Arc<Hy2Client>) -> Self {
         Self {
             inner,
             request: Some(encode_tcp_request(addr).into()),
             response: Vec::new(),
             body_offset: None,
             observer: crate::runtime::flow_observation::current(),
+            _client: Some(ClientKeepalive(client)),
         }
     }
 
@@ -603,15 +620,16 @@ impl Hysteria2Handler {
                 ))
             })
             .transpose()?;
-        // Salamander and port hopping are properties of the socket this client
-        // dials on: obfuscation wraps the UDP datagrams on the wire and hopping
-        // rotates their destination port. A detour owns that socket, so neither
-        // survives the trip — the server would see plain QUIC arriving from the
-        // detour node, which is not what the configuration asked for.
+        // Salamander is a datagram transform, so on a fronted path it is
+        // applied to the detour's framed UDP transport instead of a socket
+        // (see `SalamanderPacketTransport`). Port hopping rotates the
+        // *destination port* of each packet; a detour's transport is pinned to
+        // the one target it was dialled for, so that one still needs a socket
+        // of its own.
         anyhow::ensure!(
-            detour.is_none() || (obfs.is_none() && hop.is_none()),
-            "Hysteria2 node {}: obfs and port hopping need a socket of their own, \
-             so they cannot ride a detour",
+            detour.is_none() || hop.is_none(),
+            "Hysteria2 node {}: port hopping needs a socket of its own to rotate \
+             the destination port, so it cannot ride a detour",
             node.name
         );
         let server_name = hy2
@@ -647,18 +665,18 @@ impl Hysteria2Handler {
             },
         )
         .await?;
+        let obfs_key: Option<Arc<[u8]>> = obfs.map(|p| Arc::from(p.as_bytes()));
         let quic = QuicClient::new(node.host().to_string(), node.port, server_name, config)
             .with_flow_control_profiles(profiles)
-            .with_detour(detour.cloned());
+            .with_detour(detour.cloned())
+            .with_detour_transform(obfs_key.clone().map(salamander_transport_transform));
         let mtu = hy2.quic.mtu.unwrap_or(1252);
         let quic = quic.with_max_udp_payload_size(mtu);
-        let quic = match (obfs, hop) {
+        // `endpoint_factory` only builds the direct socket. A detour dial wins
+        // over it and obtains the same obfuscation from the transform above.
+        let quic = match (obfs_key, hop) {
             (None, None) => quic,
-            (obfs, hop) => quic.with_endpoint_factory(hy2_endpoint_factory(
-                obfs.map(|p| Arc::from(p.as_bytes())),
-                hop,
-                mtu,
-            )),
+            (obfs, hop) => quic.with_endpoint_factory(hy2_endpoint_factory(obfs, hop, mtu)),
         };
         Ok(Arc::new(Hy2Client {
             quic,
@@ -726,7 +744,7 @@ impl Hysteria2Handler {
             "Hysteria2",
         )
         .await?;
-        let stream = Hy2TcpStream::new(stream, &addr);
+        let stream = Hy2TcpStream::new(stream, &addr, client);
         Ok(ProxyStream {
             stream: Box::new(stream),
             target_addr: target,
@@ -840,18 +858,10 @@ impl TcpOutbound for Hysteria2Handler {
         connect_timeout: Duration,
         detour: &Arc<DetourPath>,
     ) -> anyhow::Result<ProxyStream> {
-        {
-            // A QUIC connection carries every flow that shares it, and the cached
-            // one was opened over the path its own caller had. A detoured dial
-            // therefore builds its own: a handshake per connection rather than a
-            // connection that belongs to somebody else's path.
-            let profiles = Some(runtime.quic_flow_control_profiles()?);
-            let client = self
-                .build_client(runtime.node.as_ref(), profiles, Some(detour))
-                .await?;
+        crate::quic::fronted_quic_dial!(self, runtime, detour, |client| {
             self.dial_via_client(client, target, target_domain, connect_timeout)
                 .await
-        }
+        })
     }
 
     async fn dial_with_tcp(
@@ -902,16 +912,11 @@ impl PacketOutbound for Hysteria2Handler {
         connect_timeout: Duration,
         detour: &Arc<DetourPath>,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
-        // A QUIC connection carries every flow that shares it, and the cached
-        // client was opened over the node's own path. Build a private client
-        // over the detour rather than borrowing one from another path.
-        let profiles = Some(runtime.quic_flow_control_profiles()?);
-        let client = self
-            .build_client(runtime.node.as_ref(), profiles, Some(detour))
-            .await?;
-        Ok(self
-            .udp_transport_via_client(client, target, target_domain, connect_timeout)
-            .await?)
+        crate::quic::fronted_quic_dial!(self, runtime, detour, |client| {
+            Ok(self
+                .udp_transport_via_client(client, target, target_domain, connect_timeout)
+                .await?)
+        })
     }
 
     async fn dial_udp_transport_speculative_runtime(

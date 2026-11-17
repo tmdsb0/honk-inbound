@@ -217,9 +217,12 @@ async fn endpoint_retains_worker_cause_and_rejection() {
     use crate::group::ScoreOutcome;
     let remote = "127.0.0.1:443".parse().unwrap();
     for rejection in [None, Some(PacketRejection::Capacity)] {
-        let endpoint =
-            packet_transport_endpoint(Arc::new(SendFailedPacketTransport(rejection)), remote)
-                .unwrap();
+        let endpoint = packet_transport_endpoint_with_mtu(
+            Arc::new(SendFailedPacketTransport(rejection)),
+            remote,
+            1252,
+        )
+        .unwrap();
         quinn::AsyncUdpSocket::try_send(
             &*endpoint.socket,
             &quinn::udp::Transmit {
@@ -264,13 +267,14 @@ async fn endpoint_retains_worker_cause_and_rejection() {
 #[tokio::test]
 async fn zero_timeout_close_does_not_surface_adapter_error() {
     let remote: SocketAddr = "127.0.0.1:443".parse().unwrap();
-    let endpoint = packet_transport_endpoint(
+    let endpoint = packet_transport_endpoint_with_mtu(
         Arc::new(AdmissionPacketTransport {
             confirmed: AtomicUsize::new(0),
             ordinary: AtomicUsize::new(0),
             ordinary_sent: tokio::sync::Notify::new(),
         }),
         remote,
+        1252,
     )
     .unwrap();
 
@@ -364,7 +368,7 @@ async fn packet_transport_socket_is_peer_pinned_and_family_matched() {
             full_cone: false,
             packets: Mutex::new(std::collections::VecDeque::from([
                 (b"wrong".to_vec(), wrong),
-                (vec![0x5a; 65], remote),
+                (b"ok".to_vec(), remote),
             ])),
         }),
         remote,
@@ -388,9 +392,12 @@ async fn packet_transport_socket_is_peer_pinned_and_family_matched() {
     .unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
 
+    // The wrong-source datagram is dropped by the receiver worker, never
+    // delivered: surfacing it as an error would kill quinn's endpoint driver.
+    // The next datagram, from the pinned peer, still arrives.
     let mut data = [0u8; 64];
     let mut meta = [quinn::udp::RecvMeta::default()];
-    let error = tokio::time::timeout(
+    let received = tokio::time::timeout(
         Duration::from_secs(1),
         std::future::poll_fn(|cx| {
             let mut bufs = [std::io::IoSliceMut::new(&mut data)];
@@ -399,8 +406,10 @@ async fn packet_transport_socket_is_peer_pinned_and_family_matched() {
     )
     .await
     .unwrap()
-    .unwrap_err();
-    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    .unwrap();
+    assert_eq!(received, 1);
+    assert_eq!(&data[..meta[0].len], b"ok");
+    assert_eq!(meta[0].addr, remote);
 }
 
 #[tokio::test]
@@ -614,12 +623,13 @@ async fn endpoint_close_keeps_worker_panic_failure_after_first_join() {
         .await
         .unwrap();
     let panicked = Arc::new(tokio::sync::Notify::new());
-    let endpoint = packet_transport_endpoint(
+    let endpoint = packet_transport_endpoint_with_mtu(
         Arc::new(PanicReceiveTransport {
             inner: UdpPacketTransport { socket, remote },
             panicked: Arc::clone(&panicked),
         }),
         remote,
+        1252,
     )
     .unwrap();
     panicked.notified().await;

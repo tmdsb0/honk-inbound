@@ -84,6 +84,8 @@ node {
 
 节点级 detour 在 TCP 和 UDP 上都生效，包括 QUIC 类（Hysteria2 / TUIC / Juicity）与 MASQUE。前置写成组时，Selector 切换或 Fallback 故障转移也会立刻改变后续拨号的前置。
 
+目标域名解析出多个地址时，走 detour 的拨号会像直连拨号一样对全部地址竞速，先通者胜；排第一的地址不通不再导致整个拨号失败。
+
 ## 4. 组级写法与继承
 
 ```dae

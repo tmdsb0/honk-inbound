@@ -70,7 +70,7 @@ impl DnsApi {
             "per_principal_requests_per_minute":super::security::REQUESTS_PER_MINUTE,"global_requests_per_minute":super::security::REQUESTS_PER_MINUTE}})
     }
     pub(crate) fn cache_capability(&self) -> Value {
-        json!({"available":true,"read":true,"delete_entry":true,"delete_name":true,"flush":true,"entry_kinds":["positive","negative"]})
+        json!({"available":true,"read":true,"delete_entry":true,"delete_name":true,"flush":true,"entry_kinds":["positive"]})
     }
     pub(crate) fn log_capability(&self) -> Value {
         log::capability(self.recorder.history())

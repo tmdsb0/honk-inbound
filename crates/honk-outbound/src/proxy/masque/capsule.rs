@@ -172,7 +172,11 @@ fn safe_8(buf: &mut impl Buf) -> Option<[u8; 8]> {
 /// front of Length would be parsed as a zero-length value and the rest of the
 /// bytes as a second, malformed capsule.
 pub fn encode_datagram(payload: &[u8]) -> BytesMut {
-    let mut buf = BytesMut::new();
+    // Reserve the whole frame up front. Starting from an empty `BytesMut`
+    // reallocates — and copies the small header — as soon as the payload is
+    // appended, which happens once per IP packet on the upstream path.
+    // 1 byte of type plus at most 8 bytes of length is the worst-case header.
+    let mut buf = BytesMut::with_capacity(payload.len() + 9);
     put_varint(&mut buf, CAPSULE_DATAGRAM);
     put_varint(&mut buf, payload.len() as u64);
     buf.put_slice(payload);

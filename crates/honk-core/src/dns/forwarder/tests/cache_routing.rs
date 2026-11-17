@@ -26,41 +26,6 @@ async fn test_fixed_domain_ttl_zero_skips_cache() {
     assert_eq!(mock.call_count.load(Ordering::SeqCst), 2);
 }
 
-/// RFC 2308 §5: negative TTL = min(SOA TTL, SOA MINIMUM).
-#[test]
-fn test_extract_soa_negative_ttl() {
-    // NXDOMAIN with authority SOA (ttl=300, minimum=60).
-    let mut resp = vec![
-        0x00, 0x00, // ID
-        0x81, 0x83, // QR + RCODE=NXDOMAIN
-        0x00, 0x01, // QDCOUNT
-        0x00, 0x00, // ANCOUNT
-        0x00, 0x01, // NSCOUNT
-        0x00, 0x00, // ARCOUNT
-    ];
-    for label in ["example", "com"] {
-        resp.push(label.len() as u8);
-        resp.extend_from_slice(label.as_bytes());
-    }
-    resp.push(0);
-    resp.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
-    // Authority SOA: name ptr, type SOA, class IN, ttl 300, rdata
-    // root mname/rname + serial/refresh/retry/expire + minimum 60.
-    resp.extend_from_slice(&[0xc0, 0x0c]);
-    resp.extend_from_slice(&[0x00, 0x06, 0x00, 0x01]);
-    resp.extend_from_slice(&300u32.to_be_bytes());
-    let mut rdata = vec![0x00, 0x00]; // MNAME, RNAME (root)
-    for v in [1u32, 7200, 3600, 1209600, 60] {
-        rdata.extend_from_slice(&v.to_be_bytes());
-    }
-    resp.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
-    resp.extend_from_slice(&rdata);
-
-    assert_eq!(extract_soa_negative_ttl(&resp), Some(60));
-    let plain = make_a_response([1, 1, 1, 1], 300);
-    assert_eq!(extract_soa_negative_ttl(&plain), None);
-}
-
 #[tokio::test]
 async fn test_cache_hit() {
     let response = make_a_response([93, 184, 216, 34], 300);
@@ -328,6 +293,12 @@ async fn selected_scopes_partition_overlapping_positive_and_negative_queries() {
             let (source, response) = result.expect("task");
             assert_response(source, &response);
         }
+        if negative {
+            // Negative answers are not cached: the second round re-asks
+            // upstream (two red, one blue), and every exchange waits for a
+            // release permit.
+            upstream.release.add_permits(3);
+        }
         for source in sources {
             let response = forwarder
                 .resolve_outcome_with_context(
@@ -339,8 +310,10 @@ async fn selected_scopes_partition_overlapping_positive_and_negative_queries() {
                 .into_rendered();
             assert_response(source, &response);
         }
-        assert_eq!(upstream.calls("red"), 1);
-        assert_eq!(upstream.calls("blue"), 1);
+        // Positive answers stay cached (one exchange per scope), while
+        // negative answers are not cached, so the second round re-asks.
+        assert_eq!(upstream.calls("red"), if negative { 3 } else { 1 });
+        assert_eq!(upstream.calls("blue"), if negative { 2 } else { 1 });
         assert_eq!(upstream.calls("trap"), 0);
     }
 }

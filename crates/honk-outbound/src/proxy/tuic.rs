@@ -731,18 +731,10 @@ impl TcpOutbound for TuicHandler {
         connect_timeout: Duration,
         detour: &Arc<DetourPath>,
     ) -> anyhow::Result<ProxyStream> {
-        {
-            // A QUIC connection carries every flow that shares it, and the cached
-            // one was opened over the path its own caller had. A detoured dial
-            // therefore builds its own: a handshake per connection rather than a
-            // connection that belongs to somebody else's path.
-            let profiles = Some(runtime.quic_flow_control_profiles()?);
-            let client = self
-                .build_client(runtime.node.as_ref(), profiles, Some(detour))
-                .await?;
+        crate::quic::fronted_quic_dial!(self, runtime, detour, |client| {
             self.dial_via_client(client, target, target_domain, connect_timeout)
                 .await
-        }
+        })
     }
 
     async fn dial_with_tcp(
@@ -793,16 +785,11 @@ impl PacketOutbound for TuicHandler {
         connect_timeout: Duration,
         detour: &Arc<DetourPath>,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
-        // A QUIC connection carries every flow that shares it, and the cached
-        // client was opened over the node's own path. Build a private client
-        // over the detour rather than borrowing one from another path.
-        let profiles = Some(runtime.quic_flow_control_profiles()?);
-        let client = self
-            .build_client(runtime.node.as_ref(), profiles, Some(detour))
-            .await?;
-        Ok(self
-            .udp_transport_via_client(client, target, target_domain, connect_timeout)
-            .await?)
+        crate::quic::fronted_quic_dial!(self, runtime, detour, |client| {
+            Ok(self
+                .udp_transport_via_client(client, target, target_domain, connect_timeout)
+                .await?)
+        })
     }
 
     async fn dial_udp_transport_speculative_runtime(

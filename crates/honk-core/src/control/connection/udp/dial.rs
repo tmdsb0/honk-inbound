@@ -126,26 +126,15 @@ impl ControlPlaneHandle {
                 #[cfg(feature = "native-api")]
                 let native = native.clone();
                 Box::pin(async move {
-                    let detour = crate::control::node_detour::group_detour(
+                    let detour = crate::control::node_detour::group_detour_for_chain(
                         &detour_config,
                         &detour_proxies,
                         &runtime_generation,
                         &detour_manager,
                         &detour_outbound,
+                        owning_group.as_deref(),
                         node.protocol(),
-                    )
-                    .or_else(|| {
-                        owning_group.as_deref().and_then(|via| {
-                            crate::control::node_detour::group_detour(
-                                &detour_config,
-                                &detour_proxies,
-                                &runtime_generation,
-                                &detour_manager,
-                                via,
-                                node.protocol(),
-                            )
-                        })
-                    });
+                    );
                     #[cfg(feature = "native-api")]
                     let mut native_attempt = native.as_ref().and_then(|observation| {
                         observation.attempt(&selection_chain, &node, target_domain.as_deref())

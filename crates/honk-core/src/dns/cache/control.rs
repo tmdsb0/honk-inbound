@@ -20,7 +20,6 @@ pub(crate) struct ExactCacheEntry {
     pub response: Option<bytes::Bytes>,
     pub expires_at: Instant,
     pub stale_until: Option<Instant>,
-    pub negative: Option<u8>,
     pub cost: usize,
 }
 
@@ -111,7 +110,7 @@ impl DnsCacheService {
     pub(crate) fn inspect_exact(
         &self,
         max_bytes: usize,
-        now: Instant,
+        _now: Instant,
         mut select: impl FnMut(&CacheKey, Instant) -> bool,
     ) -> Result<CacheInspection, CacheInspectionError> {
         let _publication = lock(&self.publication);
@@ -126,19 +125,11 @@ impl DnsCacheService {
                 let CacheSlot::Exact(key) = slot else {
                     continue;
                 };
-                let negative = value
-                    .negative
-                    .filter(|entry| now < entry.expires_at || value.positive.is_none());
-                let expires_at = negative.map_or_else(
-                    || {
-                        value
-                            .positive
-                            .as_ref()
-                            .expect("retained cache slots contain an answer")
-                            .expires_at
-                    },
-                    |entry| entry.expires_at,
-                );
+                let expires_at = value
+                    .positive
+                    .as_ref()
+                    .expect("retained cache slots contain an answer")
+                    .expires_at;
                 if !select(key, expires_at) {
                     continue;
                 }
@@ -147,19 +138,16 @@ impl DnsCacheService {
                     .checked_add(cost)
                     .filter(|total| *total <= max_bytes)
                     .ok_or(CacheInspectionError)?;
-                selected.push((key, value, negative, cost));
+                selected.push((key, value, cost));
             }
         }
         let mut entries = Vec::with_capacity(selected.len());
-        for (key, value, negative, cost) in selected {
-            let (response, expires_at, stale_until, negative) = if let Some(entry) = negative {
-                (None, entry.expires_at, None, Some(entry.rcode))
-            } else if let Some(entry) = &value.positive {
+        for (key, value, cost) in selected {
+            let (response, expires_at, stale_until) = if let Some(entry) = &value.positive {
                 (
                     Some(entry.response.clone()),
                     entry.expires_at,
                     Some(entry.expires_at + super::storage::STALE_RETENTION),
-                    None,
                 )
             } else {
                 unreachable!("retained cache slots contain an answer")
@@ -170,7 +158,6 @@ impl DnsCacheService {
                 response,
                 expires_at,
                 stale_until,
-                negative,
                 cost,
             });
         }

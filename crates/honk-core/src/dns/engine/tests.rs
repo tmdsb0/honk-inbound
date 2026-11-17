@@ -730,10 +730,13 @@ async fn identical_ineligible_queries_reach_upstream_independently_when_overlapp
 }
 
 #[tokio::test]
-async fn negative_outcome_expiry_matches_insert_and_cache_hit_lifetime() {
+async fn nxdomain_is_not_cached() {
     let query = build_dns_query("example.com", 1);
     let nxdomain = crate::dns::forwarder::make_nxdomain_response(&query, 30, 20);
-    let pool = exchange([("first", Ok(nxdomain))], None);
+    let pool = exchange(
+        [("first", Ok(nxdomain.clone())), ("first", Ok(nxdomain))],
+        None,
+    );
     let forwarder = DnsForwarder::new(
         pool.clone(),
         Arc::new(Mutex::new(DnsCache::new(8))),
@@ -741,26 +744,19 @@ async fn negative_outcome_expiry_matches_insert_and_cache_hit_lifetime() {
     )
     .with_cache_ttl(600);
 
-    let inserted = forwarder
+    let first = forwarder
         .resolve_outcome(&query)
         .await
-        .expect("negative miss");
-    let hit = forwarder
+        .expect("nxdomain miss");
+    let second = forwarder
         .resolve_outcome(&query)
         .await
-        .expect("negative hit");
+        .expect("nxdomain re-ask");
 
-    assert_eq!(inserted.response_class(), ResponseClass::Nxdomain);
-    assert_eq!(inserted.expiry().ttl(), std::time::Duration::from_secs(20));
-    assert_eq!(hit.provenance(), Provenance::Cache);
-    #[cfg(feature = "native-api")]
-    assert_eq!(hit.cache_entry_id(), None);
-    assert!(hit.expiry().is_cacheable());
-    assert!(
-        (std::time::Duration::from_secs(19)..=std::time::Duration::from_secs(20))
-            .contains(&hit.expiry().ttl())
-    );
-    assert_eq!(pool.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(first.response_class(), ResponseClass::Nxdomain);
+    assert!(!first.expiry().is_cacheable());
+    assert_eq!(second.provenance(), Provenance::Upstream);
+    assert_eq!(pool.calls.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]

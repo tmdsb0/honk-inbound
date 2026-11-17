@@ -267,10 +267,7 @@ mod tests {
             username: "u".to_owned(),
             password: "p".to_owned(),
         });
-        let items = vec![
-            wildcard,
-            listener("b", 7890, "127.0.0.1".parse().unwrap()),
-        ];
+        let items = vec![wildcard, listener("b", 7890, "127.0.0.1".parse().unwrap())];
         assert!(
             validate_listeners(&items)
                 .unwrap_err()

@@ -619,7 +619,6 @@ routing {
 
 mod routing_outbound_quotes {
     use honk_config::parser::parse_dae_config;
-    use honk_config::routing::RoutingOutbound;
 
     #[test]
     fn quoted_node_name_outbound_is_unquoted() {
@@ -633,10 +632,7 @@ routing {
 }
 ";
         let config = parse_dae_config(input).unwrap();
-        match &config.routing.rules[0].outbound {
-            RoutingOutbound::Simple(name) => assert_eq!(name, "香港-中兴(qzhk)"),
-            other => panic!("unexpected outbound: {other:?}"),
-        }
+        assert_eq!(config.routing.rules[0].outbound.as_str(), "香港-中兴(qzhk)");
         assert!(config.validate().is_ok());
     }
 }

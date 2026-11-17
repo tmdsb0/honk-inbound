@@ -668,7 +668,7 @@ async fn a_node_probe_rides_the_detour_the_node_names() {
         .nodes
         .push(Node::from_share_link(&format!("socks5://127.0.0.1:{front_port}#front")).unwrap());
     // The back node's own server is named by a literal address: the dial
-    // resolves it at this end (see `detour::resolve_endpoint`) and then asks
+    // resolves it at this end (see `detour::resolve_endpoints`) and then asks
     // the front to carry it, so no DNS is involved in the test.
     let back = Node::from_share_link("socks5://127.0.0.1:9?dialer-proxy=front#back").unwrap();
     let back_id = back.id;

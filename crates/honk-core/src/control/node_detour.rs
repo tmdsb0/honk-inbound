@@ -17,10 +17,16 @@ use std::sync::Arc;
 
 /// Bind every node that names a detour to the path it names.
 ///
-/// A detour is bound in exactly one place and read from exactly one, so no
-/// protocol can end up taking it twice. Unknown names, and a MASQUE node whose
-/// detour is another MASQUE node, are reported and skipped rather than failing
-/// the generation: one unreachable node should not take down the rest.
+/// A node-level detour is bound once here and read from `NodeRuntime::detour()`.
+/// A **group-level** detour is different: it is built fresh on each dial by
+/// [`group_detour`] and passed to the protocol handler, and when present it
+/// **wins over** the node's own `dialer-proxy` (the dial path returns early).
+/// Both eventually feed the same `DetourPath` resolution, but they are two
+/// mechanisms with that precedence, not one binding read twice.
+///
+/// Unknown names, and a MASQUE node whose detour is another MASQUE node, are
+/// reported and skipped rather than failing the generation: one unreachable
+/// node should not take down the rest.
 ///
 /// The name may be a node or a group. A group is resolved on each dial, so the
 /// front follows the group's current choice instead of whichever node happened
@@ -183,6 +189,30 @@ pub(crate) fn group_detour(
         )));
     }
     None
+}
+
+/// Resolve the detour for one dial, trying the routing group first and the
+/// selection chain's owning group second.
+///
+/// When a candidate came through a group's `final:` fallback the routing group
+/// (e.g. `Final`) names no `detour:` of its own and is not linked to the
+/// fallback group by a member edge, so looking the detour up by that name
+/// returns nothing. The chain records the real owning group as its
+/// second-to-last element; falling back to it keeps the front — and anything
+/// it inherits — applied to the dial. TCP and UDP dials used to spell this
+/// `.or_else` out independently.
+pub(crate) fn group_detour_for_chain(
+    config: &honk_config::Config,
+    proxies: &Arc<ProxyRegistry>,
+    generation: &Arc<OutboundRuntimeRegistry>,
+    manager: &Arc<GroupManager>,
+    group_name: &str,
+    owning_group: Option<&str>,
+    rider: NodeProtocol,
+) -> Option<Arc<DetourPath>> {
+    group_detour(config, proxies, generation, manager, group_name, rider).or_else(|| {
+        owning_group.and_then(|via| group_detour(config, proxies, generation, manager, via, rider))
+    })
 }
 
 #[cfg(test)]

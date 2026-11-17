@@ -545,23 +545,30 @@ fn connection(
         // Evidence chains are root-first UUIDs; tracker chains are node names
         // leaf-first. Reverse for the wire contract. doona falls back to the
         // raw string when a UUID has no name mapping, so names display fine.
-        chain: found
-            .map(|value| value.chain.clone())
-            .unwrap_or_else(|| entry.chains.iter().rev().cloned().collect()),
+        chain: found.map(|value| value.chain.clone()).unwrap_or_else(|| {
+            if full {
+                entry.chains.iter().rev().cloned().collect()
+            } else {
+                Vec::new()
+            }
+        }),
         chain_source: found.map_or("unknown", |value| value.chain_source),
         rule_id: found.and_then(|value| value.rule_id.clone()),
         rule_expression: found
             .and_then(|value| value.rule_expression.clone())
-            .or_else(|| Some(fallback_rule_expression(entry))),
+            .or_else(|| full.then(|| fallback_rule_expression(entry))),
         rule_source: found.map_or(crate::observe::vocab::RuleSource::Unknown, |value| {
             value.rule_source
         }),
         ingress: None,
         domain_source: found.and_then(|value| value.domain_source),
         started_at: found.map(|value| value.started_at.clone()).or_else(|| {
-            SystemTime::now()
-                .checked_sub(entry.start_time.elapsed())
-                .map(|time| chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339())
+            full.then(|| {
+                SystemTime::now()
+                    .checked_sub(entry.start_time.elapsed())
+                    .map(|time| chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339())
+            })
+            .flatten()
         }),
         observed_by: "userspace",
         upload_bytes: Some(entry.upload.load(Ordering::Relaxed).to_string()),

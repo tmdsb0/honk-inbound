@@ -16,52 +16,6 @@ pub(super) fn patch_txid(mut response: Vec<u8>, txid: u16) -> Vec<u8> {
     response
 }
 
-/// RFC 2308 §5 negative-cache TTL: `min(SOA TTL, SOA MINIMUM)` from the
-/// authority section. Missing SOA or malformed data yields `None`.
-pub(crate) fn extract_soa_negative_ttl(data: &[u8]) -> Option<u32> {
-    if data.len() < 12 {
-        return None;
-    }
-    let qdcount = u16::from_be_bytes([data[4], data[5]]) as usize;
-    let ancount = u16::from_be_bytes([data[6], data[7]]) as usize;
-    let nscount = u16::from_be_bytes([data[8], data[9]]) as usize;
-
-    let mut pos = 12;
-    for _ in 0..qdcount {
-        if !skip_dns_name(data, &mut pos) {
-            return None;
-        }
-        pos += 4;
-        if pos > data.len() {
-            return None;
-        }
-    }
-    for i in 0..(ancount + nscount) {
-        if !skip_dns_name(data, &mut pos) {
-            return None;
-        }
-        if pos + 10 > data.len() {
-            return None;
-        }
-        let rtype = u16::from_be_bytes([data[pos], data[pos + 1]]);
-        let ttl = u32::from_be_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]]);
-        let rdlength = u16::from_be_bytes([data[pos + 8], data[pos + 9]]) as usize;
-        if i >= ancount && rtype == 6 && rdlength >= 20 && pos + 10 + rdlength <= data.len() {
-            // SOA RDATA: MNAME, RNAME, SERIAL, REFRESH, RETRY, EXPIRE,
-            // MINIMUM — the last u32 of RDATA.
-            let minimum = u32::from_be_bytes([
-                data[pos + 10 + rdlength - 4],
-                data[pos + 10 + rdlength - 3],
-                data[pos + 10 + rdlength - 2],
-                data[pos + 10 + rdlength - 1],
-            ]);
-            return Some(ttl.min(minimum));
-        }
-        pos += 10 + rdlength;
-    }
-    None
-}
-
 /// Overwrite TTL fields on answer/authority/additional records with `ttl`,
 /// excluding EDNS OPT pseudo-records whose field is an extended control word.
 /// Malformed tails are left as-is.

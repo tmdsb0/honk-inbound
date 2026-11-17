@@ -136,9 +136,9 @@ impl ControlPlaneHandle {
                         let config = ctx.config.read().await;
                         let manager = ctx.group_manager.read();
                         // The selection chain (native-api only) records the real
-                        // owning group as its second-to-last element; fall back
-                        // to it for the detour lookup when the routing group
-                        // itself resolves to none (the `final:` fallback case).
+                        // owning group as its second-to-last element; the shared
+                        // resolver falls back to it when the routing group itself
+                        // resolves to none (the `final:` fallback case).
                         #[cfg(feature = "native-api")]
                         let owning_group = chain
                             .get(chain.len().saturating_sub(2))
@@ -148,26 +148,15 @@ impl ControlPlaneHandle {
                             });
                         #[cfg(not(feature = "native-api"))]
                         let owning_group: Option<&str> = None;
-                        crate::control::node_detour::group_detour(
+                        crate::control::node_detour::group_detour_for_chain(
                             &config,
                             &ctx.proxy_registry,
                             &generation,
                             &manager,
                             &outbound,
+                            owning_group,
                             node.protocol(),
                         )
-                        .or_else(|| {
-                            owning_group.and_then(|via| {
-                                crate::control::node_detour::group_detour(
-                                    &config,
-                                    &ctx.proxy_registry,
-                                    &generation,
-                                    &manager,
-                                    via,
-                                    node.protocol(),
-                                )
-                            })
-                        })
                     };
                     let start = std::time::Instant::now();
                     let per_dial_timeout = connect_timeout * 3;

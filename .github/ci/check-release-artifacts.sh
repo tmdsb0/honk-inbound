@@ -12,17 +12,7 @@ check() {
   fi
 }
 
-# Full: both APIs and the embedded UI, gnu and musl.
-for target in x86_64-unknown-linux-gnu x86_64-unknown-linux-musl aarch64-unknown-linux-gnu aarch64-unknown-linux-musl; do
-  for suffix in '' -stock; do
-    check "dist/honk-core-$prefix-$target$suffix-full.tar.gz"
-  done
-done
-
-# Lean variants ship for the static gateway targets only.
+# This fork ships the static musl full build only, for both gateway architectures.
 for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
-  for suffix in '' -stock; do
-    check "dist/honk-core-$prefix-$target$suffix-clash-api.tar.gz"
-    check "dist/honk-core-$prefix-$target$suffix-native-api.tar.gz"
-  done
+  check "dist/honk-core-$prefix-$target-full.tar.gz"
 done

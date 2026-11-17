@@ -801,7 +801,7 @@ A forced upstream replaces request-stage routing, not hosts/strategy precedence 
 
 `bypass` does none of the following:
 
-- Read or write positive, negative or stale cache entries.
+- Read or write positive or stale cache entries.
 - Join a writing singleflight.
 - Supersede entries or start refresh work.
 
@@ -818,7 +818,7 @@ Exhausted capacity returns `503 snapshot_unavailable` rather than clipping. An u
 
 Coverage is the runtime cache (`persistent:false`), not a SQLite inventory. Opaque `entry_id` identifies an exact cache incarnation, not merely a name/type.
 
-Name/type/expiry selection happens before snapshot byte admission and cloning. Unselected cache entries do not consume the requested snapshot's budget. Negative-answer precedence and expiry selection use one observation instant.
+Name/type/expiry selection happens before snapshot byte admission and cloning. Unselected cache entries do not consume the requested snapshot's budget. Expiry selection uses one observation instant.
 
 Every page also carries `usage {entries, entry_capacity}` for the whole runtime cache at snapshot time, ignoring the filters. `entry_capacity` is `max_cache_size` after clamping to 1–100,000. Both values are decimal strings, taken while every shard is locked, and later pages of one snapshot repeat them.
 

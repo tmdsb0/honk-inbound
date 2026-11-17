@@ -680,15 +680,18 @@ async fn native_ephemeral_close_waits_for_quic_endpoint_idle() {
         .scope_tasks(async { Ok(probe_client(&runtime, addr.port()).await) })
         .await
         .unwrap();
-    let endpoint = client
+    let DialEndpoint::Direct(endpoint) = client
         .0
         .state
         .lock()
         .await
-        .endpoint
+        .dial_endpoint
         .as_ref()
         .unwrap()
-        .clone();
+        .clone()
+    else {
+        panic!("the probe dials direct, so the cached endpoint is direct");
+    };
     assert!(endpoint.wait_idle().now_or_never().is_none());
     guard.close().await.unwrap();
     assert!(connection.close_reason().is_some());

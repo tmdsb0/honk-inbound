@@ -203,15 +203,7 @@ fn page(
                 break;
             }
         }
-        let status = if let Some(rcode) = entry.negative {
-            match rcode {
-                0 => "NODATA".to_owned(),
-                2 => "SERVFAIL".to_owned(),
-                3 => "NXDOMAIN".to_owned(),
-                5 => "REFUSED".to_owned(),
-                other => format!("RCODE{other}"),
-            }
-        } else if let Some(response) = &entry.response {
+        let status = if let Some(response) = &entry.response {
             if response.get(3).is_some_and(|value| value & 15 == 0)
                 && response.get(6..8) == Some(&[0, 0])
             {
@@ -225,9 +217,7 @@ fn page(
         let mut row = json!({"entry_id":entry.id,"domain":question.name,"type":question.rtype,"class":question.class,"status":status,
             "expires_at":at(snapshot,entry.expires_at),"stale_until":entry.stale_until.map(|value| at(snapshot,value))});
         if snapshot.filters.full {
-            let answers = if let Some(response) =
-                entry.response.as_ref().filter(|_| entry.negative.is_none())
-            {
+            let answers = if let Some(response) = entry.response.as_ref() {
                 let Some(answers) = records::page_row(
                     entry.key.wire_identity(),
                     response,
@@ -258,7 +248,7 @@ fn page(
         usize::MAX
     };
     let response = json_response(
-        &json!({"observed_at":snapshot.observed_at,"coverage":{"positive":true,"negative":true,"persistent":false},
+        &json!({"observed_at":snapshot.observed_at,"coverage":{"positive":true,"persistent":false},
         "entries":rows,"total":snapshot.entries.len(),"next_cursor":cursor,
         "usage":{"entries":usage.entries.to_string(),"entry_capacity":usage.entry_capacity.to_string()}}),
         cap,

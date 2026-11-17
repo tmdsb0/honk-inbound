@@ -36,7 +36,7 @@ use quinn::{ClientConfig, TransportConfig, VarInt};
 use crate::quic::boring::{BoringQuicClientConfig, BoringQuicOptions};
 
 use super::capsule::{put_varint, read_varint};
-use super::tun::TunDevice;
+use super::device::{TunnelBackend, TunnelDevice};
 use super::tunnel::{LivenessGuard, MasqueTunnel};
 use super::warp::{self, DEFAULT_SNI};
 
@@ -52,8 +52,13 @@ const ALPN_H3_WIRE: &[u8] = b"\x02h3";
 
 /// UDP payload size advertised to the edge. WARP endpoints carry 1280-byte IP
 /// packets plus QUIC/H3 overhead, so quinn's conservative 1252 default would
-/// cap path MTU growth below the tunnel MTU.
-const MAX_UDP_PAYLOAD_SIZE: u16 = 1350;
+/// cap path MTU growth below the tunnel MTU and could not carry a whole TUN
+/// packet. A detour re-frames each datagram inside the front node's stream
+/// transport, but that framing does not enlarge the UDP datagram itself (TCP
+/// segments the stream), so the same cap applies on both paths.
+/// Alias of the shared fronted cap, so every QUIC-over-detour path
+/// (Hysteria2, TUIC, Juicity, MASQUE h3) is guaranteed to agree.
+const MAX_UDP_PAYLOAD_SIZE: u16 = crate::quic::FRONTED_UDP_PAYLOAD_SIZE;
 
 /// DATAGRAM receive buffer. quinn advertises this as
 /// `max_datagram_frame_size`, capped at `u16::MAX`.
@@ -69,18 +74,21 @@ const CONNECT_FLOW_ID: u64 = 0;
 
 /// Open a WARP connect-ip tunnel over HTTP/3.
 ///
-/// `endpoint` is already resolved by the caller. WARP's QUIC carrier has no
-/// detour support yet: a QUIC endpoint needs a UDP socket, while `DetourPath`
-/// hands out a TCP stream, so the caller rejects a detoured h3 node instead of
-/// silently dialling direct.
+/// `endpoints` are already resolved by the caller, in answer order; the QUIC
+/// connection is raced across them. On a detour, QUIC rides the framed UDP
+/// transport the front node hands back, adapted into a quinn endpoint;
+/// without one it binds a socket of its own as before.
+#[allow(clippy::too_many_arguments)]
 pub async fn open_h3(
     node: &Node,
-    endpoint: SocketAddr,
+    endpoints: &[SocketAddr],
     connect_timeout: Duration,
     mtu: u32,
     tun_name: &str,
     preferred: &[IpAddr],
     slot: usize,
+    backend: TunnelBackend,
+    detour: Option<&crate::proxy::detour::DetourPath>,
 ) -> anyhow::Result<MasqueTunnel> {
     let config = node
         .masque()
@@ -100,28 +108,17 @@ pub async fn open_h3(
     let (alive, shutdown, shutdown_signal) = MasqueTunnel::liveness();
     let tun_label = tun_name.to_string();
 
-    let client = build_client_config(node)?;
-    let quinn_endpoint =
-        crate::quic::client_endpoint_with_mtu(endpoint.is_ipv6(), MAX_UDP_PAYLOAD_SIZE)?;
     let sni = config
         .tls
         .sni
         .clone()
         .unwrap_or_else(|| DEFAULT_SNI.to_string());
-    let connecting = quinn_endpoint
-        .connect_with(client, endpoint, &sni)
-        .map_err(|error| anyhow::anyhow!("masque node {}: QUIC connect failed: {error}", node.name))?;
-    let connection = tokio::time::timeout(connect_timeout, connecting)
-        .await
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "masque node {}: QUIC handshake to {endpoint} timed out after {connect_timeout:?}",
-                node.name
-            )
-        })??;
-    tracing::debug!(
-        "masque: QUIC to {endpoint} established (sni {sni}) on {tun_name}"
-    );
+    let (established, endpoint) =
+        race_quic_connection(node, endpoints, &sni, connect_timeout, detour).await?;
+    let connection = established.connection;
+    let quinn_endpoint = established.endpoint;
+    let packet_endpoint = established.packet;
+    tracing::debug!("masque: QUIC to {endpoint} established (sni {sni}) on {tun_name}");
 
     // WARP's edge does not advertise SETTINGS_ENABLE_CONNECT_PROTOCOL, so the
     // client has to enable both settings itself and not gate on the peer's.
@@ -132,7 +129,10 @@ pub async fn open_h3(
         .build(H3QuinnConnection::new(connection.clone()))
         .await
         .map_err(|error| {
-            anyhow::anyhow!("masque node {}: HTTP/3 handshake failed: {error}", node.name)
+            anyhow::anyhow!(
+                "masque node {}: HTTP/3 handshake failed: {error}",
+                node.name
+            )
         })?;
 
     let mut request = http::Request::builder()
@@ -144,10 +144,16 @@ pub async fn open_h3(
     // h3 reads the `:protocol` pseudo-header from the request's extensions.
     request.extensions_mut().insert(WARP_PROTOCOL);
     let mut request_stream = sender.send_request(request).await.map_err(|error| {
-        anyhow::anyhow!("masque node {}: CONNECT-IP request failed: {error}", node.name)
+        anyhow::anyhow!(
+            "masque node {}: CONNECT-IP request failed: {error}",
+            node.name
+        )
     })?;
     let response = request_stream.recv_response().await.map_err(|error| {
-        anyhow::anyhow!("masque node {}: CONNECT-IP response failed: {error}", node.name)
+        anyhow::anyhow!(
+            "masque node {}: CONNECT-IP response failed: {error}",
+            node.name
+        )
     })?;
     let status = response.status();
     tracing::debug!("masque: connect-ip on {tun_name} answered {status} over h3");
@@ -158,11 +164,10 @@ pub async fn open_h3(
         );
     }
 
-    let tun = Arc::new(TunDevice::create(tun_name)?);
-    tun.configure(preferred, mtu, slot)?;
+    let device = TunnelDevice::create(backend, tun_name, preferred, mtu, slot)?;
 
     // TUN -> endpoint. Each IP packet becomes one QUIC DATAGRAM.
-    let upstream_tun = tun.clone();
+    let upstream_tun = device.clone();
     let upstream_conn = connection.clone();
     let upstream_alive = LivenessGuard::new(Arc::clone(&alive));
     let upstream_shutdown = shutdown.clone();
@@ -174,7 +179,7 @@ pub async fn open_h3(
         let mut packets = 0usize;
         loop {
             let outcome = {
-                let read = upstream_tun.recv(&mut packet);
+                let read = upstream_tun.recv_packet(&mut packet);
                 tokio::pin!(read);
                 tokio::select! {
                     result = &mut read => result,
@@ -191,13 +196,34 @@ pub async fn open_h3(
                         );
                     }
                     let datagram = encode_ip_datagram(&packet[..length]);
-                    if let Err(error) = upstream_conn.send_datagram(datagram) {
-                        tracing::debug!("masque h3 datagram send failed: {error}");
-                        break;
+                    match upstream_conn.send_datagram(datagram) {
+                        Ok(()) => {}
+                        Err(quinn::SendDatagramError::TooLarge) => {
+                            // One IP packet does not fit the current path MTU.
+                            // A real link drops that packet and keeps going;
+                            // the old unconditional `break` killed every
+                            // fronted tunnel on its first large packet.
+                            static SEND_DROPS: std::sync::atomic::AtomicU64 =
+                                std::sync::atomic::AtomicU64::new(0);
+                            let drops = SEND_DROPS.fetch_add(1, Ordering::Relaxed) + 1;
+                            if drops <= 3 || drops.is_multiple_of(1000) {
+                                tracing::warn!(drops, "masque h3 dropped an oversized IP datagram");
+                            }
+                            continue;
+                        }
+                        Err(error) => {
+                            // UnsupportedByPeer / Disabled / ConnectionLost
+                            // mean no IP packet can ever be carried again.
+                            tracing::warn!(
+                                %error,
+                                "masque h3 datagram transport failed; stopping tunnel"
+                            );
+                            break;
+                        }
                     }
                 }
                 Err(error) => {
-                    tracing::debug!("masque TUN read failed: {error}");
+                    tracing::debug!("masque packet device read failed: {error}");
                     break;
                 }
             }
@@ -207,7 +233,7 @@ pub async fn open_h3(
 
     // Endpoint -> TUN. QUIC DATAGRAMs arrive whole, so unlike the HTTP/2
     // carrier there is no stream buffer and no flow control to release.
-    let downstream_tun = tun.clone();
+    let downstream_tun = device.clone();
     let downstream_conn = connection.clone();
     let downstream_alive = LivenessGuard::new(Arc::clone(&alive));
     let downstream_shutdown = shutdown.clone();
@@ -230,7 +256,7 @@ pub async fn open_h3(
                     break;
                 }
             };
-            let Some(packet) = decode_ip_datagram(&datagram) else {
+            let Some(packet) = decode_ip_datagram(datagram) else {
                 continue;
             };
             packets += 1;
@@ -240,8 +266,8 @@ pub async fn open_h3(
                     packet.len()
                 );
             }
-            if let Err(error) = downstream_tun.send(&packet).await {
-                tracing::debug!("masque TUN write failed: {error}");
+            if let Err(error) = downstream_tun.send_packet(&packet).await {
+                tracing::debug!("masque packet device write failed: {error}");
                 let _ = downstream_shutdown.send(true);
                 return;
             }
@@ -258,6 +284,9 @@ pub async fn open_h3(
     let mut park_signal = shutdown_signal.clone();
     tokio::spawn(async move {
         let _endpoint = quinn_endpoint;
+        // Dropping the packet endpoint stops the adapter workers that move
+        // QUIC datagrams through the detour; it has to outlive the tunnel.
+        let _packet_endpoint = packet_endpoint;
         let _sender = sender;
         let _request_stream = request_stream;
         let driver_closed = async {
@@ -273,7 +302,7 @@ pub async fn open_h3(
     });
 
     Ok(MasqueTunnel::new(
-        tun,
+        device,
         preferred.to_vec(),
         alive,
         shutdown,
@@ -282,7 +311,141 @@ pub async fn open_h3(
 
 /// Assemble the QUIC TLS config WARP expects: ALPN `h3`, the device client
 /// certificate, and a public-key pin instead of PKI verification.
-fn build_client_config(node: &Node) -> anyhow::Result<ClientConfig> {
+/// A QUIC connection to one WARP endpoint, plus the endpoint owners that
+/// must outlive the tunnel built on it: dropping the quinn endpoint closes
+/// the connection, and dropping the packet endpoint stops the adapter
+/// workers that move datagrams through the detour.
+struct EstablishedQuic {
+    connection: quinn::Connection,
+    endpoint: quinn::Endpoint,
+    packet: Option<Arc<crate::quic::PacketTransportEndpoint>>,
+}
+
+/// Establish the QUIC connection to the first of `endpoints` that answers,
+/// racing them the way a direct dial races resolved addresses. The handshake
+/// is the raced step: the TUN device and the h3 CONNECT are built once, on
+/// the winner, so a losing attempt can never create a second device under
+/// the same tunnel name.
+async fn race_quic_connection(
+    node: &Node,
+    endpoints: &[SocketAddr],
+    sni: &str,
+    connect_timeout: Duration,
+    detour: Option<&crate::proxy::detour::DetourPath>,
+) -> anyhow::Result<(EstablishedQuic, SocketAddr)> {
+    // Resolve the front once for the whole race: a group front selected per
+    // attempt would burn one round-robin turn per address tried, and the
+    // attempts could ride different fronts.
+    let carrier = match detour {
+        Some(path) => Some(path.resolve(crate::alive::ProbeDomain::DataUdp)?),
+        None => None,
+    };
+    crate::address_race::race_resolved_addrs(endpoints, |endpoint| async move {
+        let established =
+            quic_connection_to(node, endpoint, sni, connect_timeout, detour, carrier).await?;
+        Ok((established, endpoint))
+    })
+    .await
+    .ok_or_else(|| anyhow::anyhow!("masque node {}: no resolved address to dial", node.name))?
+}
+
+/// One QUIC handshake to one endpoint: the transport (a detour's framed UDP
+/// transport, or a socket of our own), adapted into a quinn endpoint, then
+/// the handshake itself with the same timeout a direct QUIC dial uses.
+///
+/// `carrier` is the front `race_quic_connection` resolved for this dial,
+/// present exactly when `detour` is: the handshake reuses it instead of
+/// selecting a group front again per attempted address.
+async fn quic_connection_to(
+    node: &Node,
+    endpoint: SocketAddr,
+    sni: &str,
+    connect_timeout: Duration,
+    detour: Option<&crate::proxy::detour::DetourPath>,
+    carrier: Option<uuid::Uuid>,
+) -> anyhow::Result<EstablishedQuic> {
+    let client = build_client_config(node, detour.is_some())?;
+    // A detour cannot give us a real UDP socket, but it can give us a framed
+    // UDP transport pinned to the WARP endpoint.
+    // `packet_transport_endpoint_with_mtu` adapts that into a quinn
+    // `AsyncUdpSocket`, so the QUIC handshake below is the same on both paths.
+    let (quinn_endpoint, packet_endpoint) = match (detour, carrier) {
+        (Some(path), Some(carrier)) => {
+            let transport = path
+                .connect_udp_via(carrier, endpoint, Some(node.host()), connect_timeout)
+                .await
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "masque node {}: {}: {error}",
+                        node.name,
+                        crate::proxy::detour::udp_carry_context(endpoint)
+                    )
+                })?;
+            let packet = Arc::new(
+                crate::quic::packet_transport_endpoint_with_mtu(
+                    transport,
+                    endpoint,
+                    MAX_UDP_PAYLOAD_SIZE,
+                )
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "masque node {}: {}: {error}",
+                        node.name,
+                        crate::proxy::detour::quic_endpoint_context(endpoint)
+                    )
+                })?,
+            );
+            (packet.endpoint().clone(), Some(packet))
+        }
+        (None, None) => (
+            crate::quic::client_endpoint_with_mtu(endpoint.is_ipv6(), MAX_UDP_PAYLOAD_SIZE)?,
+            None,
+        ),
+        _ => unreachable!(
+            "race_quic_connection resolves the carrier exactly when a detour is present"
+        ),
+    };
+    let connecting = quinn_endpoint
+        .connect_with(client, endpoint, sni)
+        .map_err(|error| {
+            anyhow::anyhow!("masque node {}: QUIC connect failed: {error}", node.name)
+        })?;
+    // quinn only ever reports a generic timeout / endpoint stopping here, but
+    // the adapter workers know the datagram-level cause (send queue closed,
+    // transport rejection, receive error). Surface it while the packet
+    // endpoint is still alive, otherwise every fronted failure looks alike.
+    match tokio::time::timeout(connect_timeout, connecting).await {
+        Ok(Ok(connection)) => Ok(EstablishedQuic {
+            connection,
+            endpoint: quinn_endpoint,
+            packet: packet_endpoint,
+        }),
+        Ok(Err(error)) => {
+            let cause = packet_endpoint
+                .as_ref()
+                .and_then(|packet| packet.terminal_error())
+                .map(|cause| format!("; transport error: {cause}"))
+                .unwrap_or_default();
+            anyhow::bail!(
+                "masque node {}: QUIC handshake to {endpoint} failed: {error}{cause}",
+                node.name
+            );
+        }
+        Err(_) => {
+            let cause = packet_endpoint
+                .as_ref()
+                .and_then(|packet| packet.terminal_error())
+                .map(|cause| format!("; transport error: {cause}"))
+                .unwrap_or_default();
+            anyhow::bail!(
+                "masque node {}: QUIC handshake to {endpoint} timed out after {connect_timeout:?}{cause}",
+                node.name
+            );
+        }
+    }
+}
+
+fn build_client_config(node: &Node, fronted: bool) -> anyhow::Result<ClientConfig> {
     let config = node
         .masque()
         .ok_or_else(|| anyhow::anyhow!("masque node {} has no masque config", node.name))?;
@@ -296,7 +459,10 @@ fn build_client_config(node: &Node) -> anyhow::Result<ClientConfig> {
     let device = PKey::private_key_from_der(&warp::decode_base64(private_key, "private-key")?)?;
     let certificate = warp::self_signed(&device)?;
     let pinned = match config.endpoint_public_key.as_deref() {
-        Some(key) => Some(PKey::public_key_from_der(&warp::decode_base64(key, "public-key")?)?),
+        Some(key) => Some(PKey::public_key_from_der(&warp::decode_base64(
+            key,
+            "public-key",
+        )?)?),
         None => {
             tracing::warn!(
                 "masque node {}: no public-key, so the QUIC endpoint is not pinned",
@@ -325,6 +491,17 @@ fn build_client_config(node: &Node) -> anyhow::Result<ClientConfig> {
     transport.datagram_receive_buffer_size(Some(DATAGRAM_BUFFER_SIZE));
     transport.max_concurrent_uni_streams(VarInt::from_u32(3));
     transport.keep_alive_interval(Some(Duration::from_secs(15)));
+    if fronted {
+        // A detour carries whole UDP datagrams inside the front node's stream
+        // transport (TCP segments the stream, so 1350-byte datagrams arrive
+        // intact), but quinn cannot run path MTU discovery through an
+        // abstract socket: it stays at the 1200-byte initial MTU and rejects
+        // every 1280-byte TUN IP packet as "datagram too large". That killed
+        // the tunnel right after CONNECT-IP answered 200 OK. Pin the send MTU
+        // to the same cap the endpoint advertises instead of probing for it.
+        transport.initial_mtu(MAX_UDP_PAYLOAD_SIZE);
+        transport.mtu_discovery_config(None);
+    }
     client.transport_config(Arc::new(transport));
     Ok(client)
 }
@@ -342,8 +519,8 @@ fn encode_ip_datagram(packet: &[u8]) -> Bytes {
 /// Unwrap one HTTP/3 DATAGRAM, checking both identifiers before handing the
 /// remaining bytes to the TUN device. Datagrams for another flow or context
 /// are dropped, not treated as IP packets.
-fn decode_ip_datagram(datagram: &[u8]) -> Option<Bytes> {
-    let mut cursor: &[u8] = datagram;
+fn decode_ip_datagram(datagram: Bytes) -> Option<Bytes> {
+    let mut cursor: &[u8] = &datagram;
     let flow_id = read_varint(&mut cursor)?;
     if flow_id != CONNECT_FLOW_ID {
         tracing::trace!("masque h3: dropping datagram for flow {flow_id}");
@@ -357,7 +534,11 @@ fn decode_ip_datagram(datagram: &[u8]) -> Option<Bytes> {
     if cursor.is_empty() {
         return None;
     }
-    Some(Bytes::copy_from_slice(cursor))
+    // quinn already hands us a refcounted buffer. Slice the two IDs off the
+    // front instead of copying the whole IP packet a second time on the
+    // downstream path of every datagram.
+    let header_len = datagram.len() - cursor.len();
+    Some(datagram.slice(header_len..))
 }
 
 #[cfg(test)]
@@ -370,7 +551,10 @@ mod tests {
         let encoded = encode_ip_datagram(&packet);
         // flow id 0, context id 0, then the packet verbatim.
         assert_eq!(&encoded[..2], b"\x00\x00");
-        assert_eq!(decode_ip_datagram(&encoded).unwrap().as_ref(), packet.as_slice());
+        assert_eq!(
+            decode_ip_datagram(encoded.clone()).unwrap().as_ref(),
+            packet.as_slice()
+        );
     }
 
     #[test]
@@ -388,20 +572,20 @@ mod tests {
         put_varint(&mut wrong_flow, 1);
         put_varint(&mut wrong_flow, 0);
         wrong_flow.extend_from_slice(b"\x45\x00");
-        assert!(decode_ip_datagram(&wrong_flow).is_none());
+        assert!(decode_ip_datagram(wrong_flow.freeze()).is_none());
 
         let mut wrong_context = BytesMut::new();
         put_varint(&mut wrong_context, 0);
         put_varint(&mut wrong_context, 7);
         wrong_context.extend_from_slice(b"\x45\x00");
-        assert!(decode_ip_datagram(&wrong_context).is_none());
+        assert!(decode_ip_datagram(wrong_context.freeze()).is_none());
     }
 
     #[test]
     fn truncated_datagrams_are_dropped() {
-        assert!(decode_ip_datagram(b"").is_none());
-        assert!(decode_ip_datagram(b"\x00").is_none());
-        assert!(decode_ip_datagram(b"\x00\x00").is_none());
+        assert!(decode_ip_datagram(Bytes::from_static(b"")).is_none());
+        assert!(decode_ip_datagram(Bytes::from_static(b"\x00")).is_none());
+        assert!(decode_ip_datagram(Bytes::from_static(b"\x00\x00")).is_none());
     }
 
     #[test]

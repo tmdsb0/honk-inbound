@@ -274,10 +274,7 @@ async fn udp_close_without_exact_pool_owner_completes_all_claims() {
                     .unwrap(),
             );
             assert_eq!(first.wait().await, CloseOutcome::Failed);
-            assert_eq!(
-                tracker.close_id("missing-owner").await,
-                CloseOutcome::Gone
-            );
+            assert_eq!(tracker.close_id("missing-owner").await, CloseOutcome::Gone);
             // The failed row was already reclaimed at `start_close`, so a
             // later bulk sweep has nothing left to retire. The failure itself
             // is still observable through `first.wait()` above and the owner's
@@ -290,10 +287,7 @@ async fn udp_close_without_exact_pool_owner_completes_all_claims() {
                     .failed
             );
             signal.finish(true);
-            assert_eq!(
-                tracker.close_id("missing-owner").await,
-                CloseOutcome::Gone
-            );
+            assert_eq!(tracker.close_id("missing-owner").await, CloseOutcome::Gone);
             let replacement = CloseSignal::new();
             tracker.register_owned(
                 tracked_entry("missing-owner", source, destination),

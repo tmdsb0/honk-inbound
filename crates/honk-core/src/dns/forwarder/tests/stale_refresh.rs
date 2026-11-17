@@ -503,7 +503,7 @@ async fn wait_for_refresh_completion(forwarder: &DnsForwarder) {
 }
 
 #[tokio::test]
-async fn refresh_nxdomain_without_soa_retires_the_refreshed_positive() {
+async fn refresh_nxdomain_leaves_the_stale_positive() {
     let query = make_a_query();
     let upstream = Arc::new(RefreshFenceUpstream {
         initial: make_a_response([192, 0, 2, 1], 1),
@@ -525,15 +525,19 @@ async fn refresh_nxdomain_without_soa_retires_the_refreshed_positive() {
     upstream.refresh_release.add_permits(1);
     wait_for_refresh_completion(&forwarder).await;
 
-    let error = forwarder
+    let stale = forwarder
         .resolve_outcome(&query)
         .await
-        .expect_err("retired positive must not be served stale");
-    assert!(matches!(error.unshared(), DnsForwardError::Exchange { .. }));
+        .expect("stale positive survives a failed refresh");
+    assert_eq!(stale.provenance(), Provenance::Stale);
+    assert_eq!(
+        stale.answer_ips(),
+        &[IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 1))]
+    );
 }
 
 #[tokio::test]
-async fn foreground_nxdomain_retires_expired_positive() {
+async fn foreground_nxdomain_leaves_the_stale_positive() {
     let query = make_a_query();
     let upstream = Arc::new(RefreshFenceUpstream {
         initial: make_a_response([192, 0, 2, 1], 1),
@@ -553,11 +557,15 @@ async fn foreground_nxdomain_retires_expired_positive() {
     let negative = forwarder.resolve_outcome(&query).await.expect("nxdomain");
     assert_eq!(negative.response_class(), ResponseClass::Nxdomain);
 
-    let error = forwarder
+    let stale = forwarder
         .resolve_outcome(&query)
         .await
-        .expect_err("retired positive must not be served stale");
-    assert!(matches!(error.unshared(), DnsForwardError::Exchange { .. }));
+        .expect("stale positive survives a foreground failure");
+    assert_eq!(stale.provenance(), Provenance::Stale);
+    assert_eq!(
+        stale.answer_ips(),
+        &[IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 1))]
+    );
 }
 
 #[tokio::test]
@@ -631,19 +639,19 @@ async fn owning_refresh_publishes_a_changed_positive() {
 }
 
 #[tokio::test]
-async fn held_refresh_does_not_overwrite_a_newer_foreground_nxdomain() {
+async fn held_refresh_does_not_overwrite_a_newer_foreground_positive() {
     let query = make_a_query();
-    let foreground = make_nxdomain_response(&query, 1, 1);
+    let parsed = QueryContext::parse(&query).expect("query");
     let upstream = Arc::new(RefreshFenceUpstream {
         initial: make_a_response([192, 0, 2, 1], 1),
-        refreshed: make_a_response([192, 0, 2, 2], 300),
-        later: RefreshFenceLater::Response(foreground),
+        refreshed: make_empty_response(&query, &parsed),
+        later: RefreshFenceLater::Response(make_a_response([192, 0, 2, 9], 300)),
         call_count: AtomicUsize::new(0),
         refresh_entered: tokio::sync::Notify::new(),
         refresh_release: tokio::sync::Semaphore::new(0),
     });
     let cache = test_cache();
-    let forwarder = DnsForwarder::new(upstream.clone(), cache.clone(), test_router());
+    let forwarder = DnsForwarder::new(upstream.clone(), cache, test_router());
 
     forwarder.resolve_outcome(&query).await.expect("initial");
     forwarder.resolve_outcome(&query).await.expect("cache hit");
@@ -654,11 +662,14 @@ async fn held_refresh_does_not_overwrite_a_newer_foreground_nxdomain() {
     let foreground = forwarder
         .resolve_outcome(&query)
         .await
-        .expect("foreground nxdomain");
+        .expect("foreground positive");
     assert_eq!(foreground.status(), OutcomeStatus::Accepted);
-    assert_eq!(foreground.response_class(), ResponseClass::Nxdomain);
+    assert_eq!(foreground.response_class(), ResponseClass::Positive);
     assert_eq!(foreground.provenance(), Provenance::Upstream);
-    assert_eq!(foreground.rendered()[3] & 0x0f, 3);
+    assert_eq!(
+        foreground.answer_ips(),
+        &[IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 9))]
+    );
 
     upstream.refresh_release.add_permits(1);
     wait_for_refresh_completion(&forwarder).await;
@@ -666,67 +677,14 @@ async fn held_refresh_does_not_overwrite_a_newer_foreground_nxdomain() {
     let retained = forwarder
         .resolve_outcome(&query)
         .await
-        .expect("negative hit");
+        .expect("positive hit");
     assert_eq!(retained.status(), OutcomeStatus::Accepted);
-    assert_eq!(retained.response_class(), ResponseClass::Nxdomain);
+    assert_eq!(retained.response_class(), ResponseClass::Positive);
     assert_eq!(retained.provenance(), Provenance::Cache);
-    assert_eq!(retained.rendered()[3] & 0x0f, 3);
-}
-
-#[tokio::test]
-async fn held_refresh_does_not_overwrite_a_newer_foreground_positive() {
-    let query = make_a_query();
-    let parsed = QueryContext::parse(&query).expect("query");
-    let refresh_responses = [
-        make_nxdomain_response(&query, 1, 1),
-        make_empty_response(&query, &parsed),
-    ];
-
-    for refresh_response in refresh_responses {
-        let upstream = Arc::new(RefreshFenceUpstream {
-            initial: make_a_response([192, 0, 2, 1], 1),
-            refreshed: refresh_response,
-            later: RefreshFenceLater::Response(make_a_response([192, 0, 2, 9], 300)),
-            call_count: AtomicUsize::new(0),
-            refresh_entered: tokio::sync::Notify::new(),
-            refresh_release: tokio::sync::Semaphore::new(0),
-        });
-        let cache = test_cache();
-        let forwarder = DnsForwarder::new(upstream.clone(), cache, test_router());
-
-        forwarder.resolve_outcome(&query).await.expect("initial");
-        forwarder.resolve_outcome(&query).await.expect("cache hit");
-        wait_for_refresh_start(&upstream).await;
-        let service = forwarder.cache_service().await;
-        service.expire_positive_exact_for_test(&resolve_cache_key(&query));
-
-        let foreground = forwarder
-            .resolve_outcome(&query)
-            .await
-            .expect("foreground positive");
-        assert_eq!(foreground.status(), OutcomeStatus::Accepted);
-        assert_eq!(foreground.response_class(), ResponseClass::Positive);
-        assert_eq!(foreground.provenance(), Provenance::Upstream);
-        assert_eq!(
-            foreground.answer_ips(),
-            &[IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 9))]
-        );
-
-        upstream.refresh_release.add_permits(1);
-        wait_for_refresh_completion(&forwarder).await;
-
-        let retained = forwarder
-            .resolve_outcome(&query)
-            .await
-            .expect("positive hit");
-        assert_eq!(retained.status(), OutcomeStatus::Accepted);
-        assert_eq!(retained.response_class(), ResponseClass::Positive);
-        assert_eq!(retained.provenance(), Provenance::Cache);
-        assert_eq!(
-            retained.answer_ips(),
-            &[IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 9))]
-        );
-    }
+    assert_eq!(
+        retained.answer_ips(),
+        &[IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 9))]
+    );
 }
 
 #[tokio::test]

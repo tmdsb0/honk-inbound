@@ -36,8 +36,13 @@ fn netkit_fallback_is_only_for_missing_driver() {
     assert!(netkit_unavailable(&io::Error::from_raw_os_error(
         libc::EOPNOTSUPP
     )));
-    assert!(!netkit_unavailable(&io::Error::from_raw_os_error(
+    // Kernels report an unsupported link kind as EINVAL or ENOSYS too; the
+    // fallback must trigger for those as well, not only for EOPNOTSUPP.
+    assert!(netkit_unavailable(&io::Error::from_raw_os_error(
         libc::EINVAL
+    )));
+    assert!(netkit_unavailable(&io::Error::from_raw_os_error(
+        libc::ENOSYS
     )));
     assert!(!netkit_unavailable(&io::Error::from_raw_os_error(
         libc::EPERM

@@ -1,3 +1,0 @@
-Fixed
-
-- Switching a chained proxy's front node now takes effect immediately for every protocol, without restarting honk. A reload reuses the runtime of a node whose own config did not change, but its detour binding belonged to the previous generation and could not be replaced, so the new front was ignored; bindings are now rebound (or cleared) on each generation. A MASQUE tunnel is a long-lived carrier opened once over whichever front the group then selected, and its cache was keyed only by group name, so every later flow kept riding the old member's connection; the cache now records the carrier node and rebuilds the tunnel — releasing the old TUN device — as soon as the front changes.

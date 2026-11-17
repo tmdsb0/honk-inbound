@@ -94,7 +94,10 @@ async fn tcp_close_claims_share_guard_retirement() -> anyhow::Result<()> {
         assert_eq!(upstream.read(&mut byte).await?, 0);
         let mut completion = Box::pin(completion.wait());
         assert!(futures::poll!(&mut completion).is_pending());
-        assert_eq!(tracker.snapshot().len(), 1);
+        // The row is reclaimed at retirement admission (handoff.rs retire()),
+        // while the close only completes once the worker settles the kernel
+        // retirement behind the ebpf write lock held above.
+        assert!(tracker.snapshot().is_empty());
         drop(backend);
         assert_eq!(completion.await, CloseOutcome::Closed);
         assert_eq!(duplicate.await, CloseOutcome::Closed);

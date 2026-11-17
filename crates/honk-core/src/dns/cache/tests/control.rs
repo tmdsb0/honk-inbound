@@ -112,8 +112,7 @@ fn bounded_inspection_retains_every_variant_without_touching_lru_or_counters() {
     assert_eq!(rows.len(), 4);
     assert!(rows.iter().all(|row| row.response.is_some()
         && row.expires_at > std::time::Instant::now()
-        && row.stale_until.is_some_and(|until| until > row.expires_at)
-        && row.negative.is_none()));
+        && row.stale_until.is_some_and(|until| until > row.expires_at)));
     for key in [&base, &other, &profile, &policy] {
         assert!(rows.iter().any(|row| &row.key == key));
     }
@@ -193,52 +192,6 @@ fn inspection_selection_precedes_byte_admission() {
     assert_eq!(service.counters(), before);
 }
 
-#[test]
-fn inspection_selection_uses_the_same_instant_as_negative_precedence() {
-    let service = DnsCache::new(128).service();
-    let key = key("example.com", 1, IngressProfile::Internal, "default");
-    service.put_exact(
-        key.clone(),
-        make_test_response([192, 0, 2, 1], 300),
-        300,
-        None,
-    );
-    service.put_negative_exact(key, 30, 3);
-    let negative = service
-        .inspect_exact(4096, Instant::now(), |_, _| true)
-        .unwrap()
-        .entries;
-    assert_eq!(negative[0].negative, Some(3));
-    assert!(negative[0].response.is_none());
-
-    let now = negative[0].expires_at;
-    let positive = service
-        .inspect_exact(4096, now, |_, expires_at| expires_at > now)
-        .unwrap()
-        .entries;
-    assert_eq!(positive.len(), 1);
-    assert!(positive[0].response.is_some());
-    assert!(positive[0].negative.is_none());
-    assert_eq!(positive[0].id, negative[0].id);
-
-    let now = positive[0].expires_at;
-    assert!(
-        service
-            .inspect_exact(0, now, |_, expires_at| expires_at > now)
-            .unwrap()
-            .entries
-            .is_empty()
-    );
-    assert_eq!(
-        service
-            .inspect_exact(4096, now, |_, _| true)
-            .unwrap()
-            .entries[0]
-            .id,
-        positive[0].id
-    );
-}
-
 #[tokio::test]
 async fn name_invalidation_fences_foreground_refresh_and_restore_across_variants() {
     let cache = DnsCache::new(128);
@@ -253,10 +206,6 @@ async fn name_invalidation_fences_foreground_refresh_and_restore_across_variants
     for key in [&first, &second, &other_type, &unrelated] {
         service.put_exact(key.clone(), response.clone(), 300, None);
     }
-    let revision = match service.lookup_exact(&first, true) {
-        ExactLookup::Positive { revision, .. } => revision,
-        _ => panic!("positive fixture"),
-    };
     let result = service
         .invalidate(CacheInvalidation::Name {
             name: "EXAMPLE.com.".into(),
@@ -273,11 +222,6 @@ async fn name_invalidation_fences_foreground_refresh_and_restore_across_variants
     assert!(
         service
             .put_exact_if_current(old_epoch, first.clone(), response.clone(), 300, None)
-            .is_none()
-    );
-    assert!(
-        service
-            .put_negative_if_current(old_epoch, first.clone(), 30, 3, Some(revision))
             .is_none()
     );
     assert!(!service.put_restored_exact_if_current(
@@ -333,14 +277,14 @@ fn usage_reports_the_clamped_entry_capacity() {
 async fn usage_counts_the_whole_cache_regardless_of_the_listing_filter() {
     let service = DnsCache::new(128).service();
     let positive = key("example.com", 1, IngressProfile::Internal, "default");
-    let negative = key("missing.example", 1, IngressProfile::Internal, "default");
+    let missing = key("missing.example", 1, IngressProfile::Internal, "default");
     service.put_exact(
         positive.clone(),
         make_test_response([192, 0, 2, 1], 300),
         300,
         None,
     );
-    service.put_negative_exact(negative, 30, 3);
+    service.put_exact(missing, make_test_response([192, 0, 2, 2], 300), 300, None);
 
     let inspection = service
         .inspect_exact(4096, Instant::now(), |key, _| key == &positive)

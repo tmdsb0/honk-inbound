@@ -173,11 +173,15 @@ pub(crate) async fn maybe_tls_wrap_concrete(
     // interface while looking like a normal connection.
     crate::proxy::detour::ensure_bound(node, detour)?;
     let address = endpoint_address(node);
+    // The dialled peer rides along with the carrier: a detour hands back a
+    // chained carrier (a byte stream), not a socket, so `peer_addr()` cannot
+    // answer, and the REALITY re-dial below must reuse the endpoint the race
+    // already won rather than resolving again.
     let initial_tcp = async {
         if let Some(path) = detour {
-            let endpoint = crate::proxy::detour::resolve_endpoint(&address).await?;
-            let stream = path
-                .connect(endpoint, connect_timeout)
+            let endpoints = crate::proxy::detour::resolve_endpoints(&address).await?;
+            let (stream, endpoint) = path
+                .connect_raced(&endpoints, connect_timeout)
                 .await
                 .map_err(|error| {
                     anyhow::anyhow!(
@@ -188,7 +192,7 @@ pub(crate) async fn maybe_tls_wrap_concrete(
             // The block's error type has to be pinned here: the detour dial
             // returns before the surrounding `?` conversions have anything to
             // unify against.
-            return Ok::<_, anyhow::Error>(Carrier::Chained(stream));
+            return Ok::<_, anyhow::Error>((Carrier::Chained(stream), Some(endpoint)));
         }
         match tcp {
             Some(tcp) => {
@@ -201,10 +205,11 @@ pub(crate) async fn maybe_tls_wrap_concrete(
                         },
                     );
                 }
-                Ok(Carrier::Socket(tcp))
+                Ok((Carrier::Socket(tcp), None))
             }
-            None => Ok(Carrier::Socket(
-                crate::util::connect_outbound(&address, connect_timeout).await?,
+            None => Ok((
+                Carrier::Socket(crate::util::connect_outbound(&address, connect_timeout).await?),
+                None,
             )),
         }
     };
@@ -212,8 +217,17 @@ pub(crate) async fn maybe_tls_wrap_concrete(
         let deadline = tokio::time::Instant::now() + connect_timeout * 3;
         let alpn = node.is_xhttp().then_some(b"\x02h2".as_slice());
         let setup = async {
-            let tcp = initial_tcp.await?;
-            let peer = tcp.peer_addr()?;
+            let (tcp, detour_peer) = initial_tcp.await?;
+            // A detour hands back a chained carrier (a byte stream), not a
+            // socket, so `peer_addr()` cannot answer. The re-dial target is
+            // the endpoint the race already dialled; using it keeps the
+            // replacement handshake on exactly the same fronted path instead
+            // of leaking out of the real interface.
+            let peer = if let Some(peer) = detour_peer {
+                peer
+            } else {
+                tcp.peer_addr()?
+            };
             let tcp = ObservedTcp::new_carrier(tcp);
             let chrome = crate::tls::chrome_mode();
             let mut tls_stream = match crate::reality::reality_connect_with_key_shares(
@@ -283,7 +297,8 @@ pub(crate) async fn maybe_tls_wrap_concrete(
                 std::io::Error::new(std::io::ErrorKind::TimedOut, "REALITY setup timeout")
             })?;
     }
-    let mut tcp = ObservedTcp::new_carrier(initial_tcp.await?);
+    let (carrier, _) = initial_tcp.await?;
+    let mut tcp = ObservedTcp::new_carrier(carrier);
     if tls.enabled {
         let connector = crate::tls::build_connector(node)?;
         let server_name = tls.sni.clone().unwrap_or_else(|| node.host().to_string());

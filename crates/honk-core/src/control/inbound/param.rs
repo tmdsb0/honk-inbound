@@ -140,13 +140,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> ReadBuffer<S> {
     pub(super) async fn read_head(&mut self, deadline: Instant) -> Result<Vec<u8>, ProtoError> {
         loop {
             let window = &self.buf[self.pos..];
-            if window.len() >= 4 {
-                if let Some(index) = window.windows(4).position(|w| w == b"\r\n\r\n") {
-                    let end = self.pos + index + 4;
-                    let head = self.buf[self.pos..end].to_vec();
-                    self.pos = end;
-                    return Ok(head);
-                }
+            if window.len() >= 4
+                && let Some(index) = window.windows(4).position(|w| w == b"\r\n\r\n")
+            {
+                let end = self.pos + index + 4;
+                let head = self.buf[self.pos..end].to_vec();
+                self.pos = end;
+                return Ok(head);
             }
             self.pull(deadline).await?;
         }
@@ -231,7 +231,7 @@ mod tests {
     async fn oversized_head_is_rejected() {
         let (mut client, server) = tokio::io::duplex(4096);
         let mut rb = ReadBuffer::new(server, 32);
-        client.write_all(&vec![b'x'; 64]).await.unwrap();
+        client.write_all(&[b'x'; 64]).await.unwrap();
         assert!(matches!(
             rb.read_head(deadline()).await,
             Err(ProtoError::TooLarge)

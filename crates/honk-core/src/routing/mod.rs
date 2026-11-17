@@ -573,9 +573,7 @@ impl Router {
         let inbound_matched = route.inbound.is_empty()
             || inbound.is_some_and(|name| route.inbound.iter().any(|value| value == name));
         let inbound_not_matched = route.inbound_not.is_empty()
-            || inbound.map_or(true, |name| {
-                !route.inbound_not.iter().any(|value| value == name)
-            });
+            || inbound.is_none_or(|name| !route.inbound_not.iter().any(|value| value == name));
         if !inbound_matched || !inbound_not_matched {
             return false;
         }

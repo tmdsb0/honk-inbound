@@ -116,6 +116,16 @@ pub struct GlobalConfig {
     pub check_tolerance_ms: u64,
     #[serde(default = "default_dial_mode")]
     pub dial_mode: String,
+    /// MASQUE IP tunnel backend. `tun` (default) creates a kernel TUN device
+    /// and lets the kernel own TCP/UDP via `SO_BINDTODEVICE` + the assigned
+    /// source address — the historical behaviour, and the only path that needs
+    /// `/dev/net/tun`, `iproute2` and `CAP_NET_ADMIN`. `userspace` routes the
+    /// tunnel's IP packets through an in-process smoltcp stack instead, so a
+    /// MASQUE node works without a TUN device or root-owned `ip` calls. The
+    /// value is a process-global startup setting: changing it takes effect on
+    /// the next restart, not a hot reload.
+    #[serde(default = "default_masque_tunnel_mode")]
+    pub masque_tunnel_mode: String,
     #[serde(default)]
     pub allow_insecure: bool,
     #[serde(default = "default_sniffing_timeout_ms")]
@@ -347,6 +357,9 @@ fn default_check_tolerance_ms() -> u64 {
 fn default_dial_mode() -> String {
     "domain".into()
 }
+fn default_masque_tunnel_mode() -> String {
+    "tun".into()
+}
 fn default_sniffing_timeout_ms() -> u64 {
     30
 }
@@ -416,6 +429,7 @@ impl Default for GlobalConfig {
             check_interval_secs: default_check_interval_secs(),
             check_tolerance_ms: default_check_tolerance_ms(),
             dial_mode: default_dial_mode(),
+            masque_tunnel_mode: default_masque_tunnel_mode(),
             allow_insecure: false,
             sniffing_timeout_ms: default_sniffing_timeout_ms(),
             tls_implementation: default_tls_impl(),
@@ -860,6 +874,17 @@ impl Config {
                 "invalid-config-value",
                 "dial_mode must be ip, domain, domain+, or domain++",
             ));
+        }
+        match self.global.masque_tunnel_mode.as_str() {
+            "tun" | "userspace" => {}
+            _ => {
+                return Err(config_validation_error(
+                    source,
+                    SettingPath::new("global").field("masque_tunnel_mode"),
+                    "invalid-config-value",
+                    "masque_tunnel_mode must be tun or userspace",
+                ));
+            }
         }
         if self.global.data_dir.is_empty()
             || !std::path::Path::new(&self.global.data_dir).is_absolute()

@@ -14,8 +14,6 @@ fn cache_counters_are_exact_for_hit_miss_and_stale_paths() {
     cache.insert_expired_for_test("stale".into(), response, 60);
     assert!(cache.get("stale").is_none());
     assert!(cache.get_stale("stale").is_some());
-    cache.put_negative("negative".into(), 60, 3);
-    assert!(cache.negative_hit("negative").is_some());
     cache.insert_beyond_stale_retention_for_test(
         "retention-exceeded".into(),
         make_test_response([192, 0, 2, 2], 60),
@@ -26,7 +24,7 @@ fn cache_counters_are_exact_for_hit_miss_and_stale_paths() {
     assert_eq!(
         cache.counters(),
         CacheCounters {
-            hits: 2,
+            hits: 1,
             misses: 3,
             stale: 1,
         }

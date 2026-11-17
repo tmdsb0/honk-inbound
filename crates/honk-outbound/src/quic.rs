@@ -1,6 +1,7 @@
 //! Shared QUIC client plumbing for QUIC-based proxy protocols.
 //!
-//! Used by the TUIC v5, Juicity, and Hysteria2 outbounds.
+//! Used by the TUIC v5, Juicity, Hysteria2 and MASQUE (HTTP/3) outbounds,
+//! including the packet-transport adapter that carries QUIC over a detour.
 
 use std::collections::HashMap;
 use std::io;
@@ -77,6 +78,17 @@ enum BbrVariant {
 /// Hysteria2 paths it delivered the same upload rate as BBRv3 while losing
 /// over half of what it sent, so BBRv3 is the default and `v1` stays a fallback.
 const DEFAULT_BBR: BbrVariant = BbrVariant::V3;
+
+/// QUIC UDP payload cap for connections carried over a detour.
+///
+/// A detour hands back whole UDP datagrams inside the front node's stream
+/// transport; TCP segments that stream, so the datagram itself is not shrunk.
+/// Peers answer a 1200-byte Initial with a 1280-byte handshake flight, and a
+/// MASQUE connect-ip tunnel needs room for one whole 1280-byte TUN IP packet,
+/// so the conservative 1252-byte direct-socket default is too small here.
+/// quinn cannot run path MTU discovery through the abstract socket a detour
+/// provides, so fronted configs also pin this value as `initial_mtu`.
+pub(crate) const FRONTED_UDP_PAYLOAD_SIZE: u16 = 1350;
 
 /// `HONK_QUIC_BBR=v1|v3`, read once; any other value warns and keeps the default.
 static BBR_VARIANT: LazyLock<BbrVariant> = LazyLock::new(|| match std::env::var("HONK_QUIC_BBR") {
@@ -462,28 +474,54 @@ pub(crate) mod defrag;
 #[cfg(test)]
 mod path_health_tests;
 
+/// The endpoint a dial built, held in the form that actually owns its driver
+/// tasks.
+///
+/// A fronted dial's quinn endpoint belongs to `PacketTransportEndpoint`; the
+/// `RuntimeEndpoint` view is only a borrow. `State` used to hold both (and a
+/// clone on every tracked connection), which let `force_close` close the same
+/// quinn endpoint twice. One value now carries both the keepalive claim and
+/// the single teardown path.
+#[derive(Clone)]
+pub(crate) enum DialEndpoint {
+    Direct(crate::runtime::RuntimeEndpoint),
+    Fronted(Arc<PacketTransportEndpoint>),
+}
+
+/// Build a private QUIC client for a dial that must ride a group detour.
+///
+/// A QUIC connection carries every flow that shares it, and a cached client
+/// was opened over the path its own caller named. Reusing it here would send
+/// the flow out of somebody else's front, so each detoured dial builds a
+/// client over the named detour instead. Hysteria2, TUIC and Juicity share
+/// this template; each supplies its own `dial` step.
+macro_rules! fronted_quic_dial {
+    ($handler:expr, $runtime:expr, $detour:expr, |$client:ident| $dial:expr) => {{
+        let profiles = Some($runtime.quic_flow_control_profiles()?);
+        let $client = $handler
+            .build_client($runtime.node.as_ref(), profiles, Some($detour))
+            .await?;
+        $dial
+    }};
+}
+pub(crate) use fronted_quic_dial;
+
 struct TrackedConnection<C> {
     id: u64,
     connection: Connection,
-    _endpoint: crate::runtime::RuntimeEndpoint,
-    /// The packet-transport endpoint that carries this connection when the node
-    /// rides a detour. Its worker tasks read and write the socket the
-    /// connection runs on, so they have to outlive it.
-    _detour: Option<Arc<PacketTransportEndpoint>>,
+    /// Keeps the endpoint's driver tasks alive for as long as any connection
+    /// reads through them.
+    _dial_endpoint: DialEndpoint,
     state: Weak<C>,
     monitor: Arc<QuicClientConnectionMonitor>,
 }
 
 struct State<C> {
-    /// Endpoint of the most recent dial that completed its handshake (cleared by
-    /// [`QuicClient::release_cached`]). Once that connection has closed, holding it
-    /// keeps its port bound while the next dial binds, so that dial gets a different
-    /// port; [`QuicClient::force_close`] also closes it.
-    endpoint: Option<crate::runtime::RuntimeEndpoint>,
-    /// The packet-transport endpoint of the most recent detour dial. Tracked
-    /// connections hold their own clone, so clearing this only ends the
-    /// client's own claim on it.
-    detour_endpoint: Option<Arc<PacketTransportEndpoint>>,
+    /// Endpoint of the most recent dial that completed its handshake (cleared
+    /// by [`QuicClient::release_cached`]). Holding it keeps its port bound
+    /// while the next dial binds, so a redial gets a different port;
+    /// [`QuicClient::force_close`] closes exactly this value.
+    dial_endpoint: Option<DialEndpoint>,
     conn: Option<(Connection, Arc<C>)>,
     connections: Vec<TrackedConnection<C>>,
     next_connection_id: u64,
@@ -524,6 +562,10 @@ pub struct QuicClient<C> {
     /// because a node that names a path out is not reaching the server on its
     /// own socket at all.
     detour: Option<Arc<crate::proxy::detour::DetourPath>>,
+    /// Wraps the framed UDP transport a detour returns before QUIC is built on
+    /// it. Hysteria2 uses this to keep Salamander obfuscation on fronted paths,
+    /// where there is no socket to attach the obfuscating `AsyncUdpSocket` to.
+    detour_transform: Option<DetourTransportTransform>,
     /// Advertised `max_udp_payload_size` cap for the default endpoint (see
     /// [`client_endpoint`] for the safe 1252 default).
     mtu: u16,
@@ -561,6 +603,13 @@ mod label_tests {
 mod packet_transport;
 
 pub use packet_transport::{
-    PacketTransportEndpoint, packet_transport_endpoint, packet_transport_endpoint_with_metrics,
-    quic_handshake_probe,
+    PacketTransportEndpoint, packet_transport_endpoint_with_metrics,
+    packet_transport_endpoint_with_mtu, quic_handshake_probe,
 };
+
+/// Wrap a detour's framed UDP transport before QUIC is built on it.
+pub(crate) type DetourTransportTransform = Arc<
+    dyn Fn(Arc<dyn crate::proxy::PacketTransport>) -> Arc<dyn crate::proxy::PacketTransport>
+        + Send
+        + Sync,
+>;

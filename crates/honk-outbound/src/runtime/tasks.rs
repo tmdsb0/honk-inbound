@@ -223,17 +223,6 @@ pub(crate) fn new_owned_quic_endpoint(
     })
 }
 
-/// Lease a QUIC endpoint this module did not build to the current owner, so
-/// generation shutdown reaps it like any other.
-///
-/// A node riding a detour runs its QUIC over a packet transport another node
-/// handed back; the endpoint exists before there is anything to build.
-pub(crate) fn adopt_owned_quic_endpoint(
-    endpoint: quinn::Endpoint,
-) -> std::io::Result<RuntimeEndpoint> {
-    new_owned_quic_endpoint(|| Ok(endpoint.clone()))
-}
-
 #[cfg(feature = "owned-tasks")]
 pub(super) fn capture_owner() -> Option<std::sync::Weak<TaskOwner>> {
     OWNER.try_with(Clone::clone).ok().flatten()

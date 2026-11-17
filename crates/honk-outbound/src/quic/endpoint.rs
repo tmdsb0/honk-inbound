@@ -143,22 +143,34 @@ impl quinn::Runtime for OwnedTaskRuntime {
     }
 
     fn spawn(&self, future: Pin<Box<dyn Future<Output = ()> + Send>>) {
+        // Every early return below used to be silent. quinn then sees no
+        // endpoint driver and reports `EndpointStopping`, which is far away
+        // from the real cause, so make each one observable.
         let Some(tasks) = self.tasks.upgrade() else {
+            tracing::warn!("quinn driver not spawned: packet endpoint's task owner was dropped");
             return;
         };
         let (start, started) = tokio::sync::oneshot::channel();
-        let Ok(task) = crate::runtime::spawn_joinable(Some(&tasks), async move {
+        let task = match crate::runtime::spawn_joinable(Some(&tasks), async move {
             if started.await.is_ok() {
                 future.await;
             }
-        }) else {
-            return;
+        }) {
+            Ok(task) => task,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "quinn driver not spawned: spawn_joinable rejected the task"
+                );
+                return;
+            }
         };
         if self.parent.as_ref().is_some_and(|parent| {
             parent
                 .upgrade()
                 .is_none_or(|parent| !parent.retain_joinable(task.clone()))
         }) {
+            tracing::warn!("quinn driver aborted: parent owner rejected the joinable");
             task.abort();
             return;
         }

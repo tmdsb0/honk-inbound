@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use super::CacheKey;
 use super::counters::CacheCounterSet;
-use super::{CacheValue, DnsCache, NegativeEntry, lock};
+use super::{CacheValue, DnsCache, lock};
 
 static CAPACITY_CLAMP_WARNED: AtomicBool = AtomicBool::new(false);
 
@@ -127,8 +127,7 @@ impl CacheShard {
         }
     }
 
-    /// Drop a slot's positive answer, and the slot itself when no negative
-    /// remains.
+    /// Drop a slot's positive answer, and the slot itself.
     pub(super) fn drop_positive(&mut self, key: &CacheSlot) {
         let Some(value) = self.entries.get_mut(key) else {
             return;
@@ -136,30 +135,7 @@ impl CacheShard {
         if let Some(entry) = value.positive.take() {
             self.retained -= entry.response.len();
         }
-        if value.negative.is_none() {
-            self.entries.pop(key);
-        }
-    }
-
-    /// Drop a slot's negative answer, and the slot itself when no positive
-    /// remains.
-    pub(super) fn drop_negative(&mut self, key: &CacheSlot) {
-        if self.entries.get_mut(key).is_some_and(|value| {
-            value.negative = None;
-            value.positive.is_none()
-        }) {
-            self.entries.pop(key);
-        }
-    }
-
-    /// Set a slot's negative answer and revision, preserving its positive answer.
-    pub(super) fn put_negative(&mut self, key: CacheSlot, negative: NegativeEntry, revision: u64) {
-        if let Some(value) = self.entries.get_mut(&key) {
-            value.negative = Some(negative);
-            value.revision = revision;
-        } else {
-            self.put(key, CacheValue::negative(negative, revision));
-        }
+        self.entries.pop(key);
     }
 
     #[cfg(test)]

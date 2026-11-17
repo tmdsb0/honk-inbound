@@ -547,7 +547,9 @@ async fn native_udp_received_reply_survives_client_send_failure_until_cleanup() 
             }
         );
         if !cleanup_succeeded {
-            assert!(pool.complete_removal(
+            // ea0d20e3: finish_removal reclaims the tombstone even when
+            // cleanup failed, so a second completion must find nothing.
+            assert!(!pool.complete_removal(
                 removal.client,
                 removal.dst,
                 removal.owner,

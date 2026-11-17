@@ -113,13 +113,81 @@ fn make_a_response(ip: [u8; 4], ttl: u32) -> Vec<u8> {
     ]
 }
 
+/// Build a CNAME-only response for example.com: one CNAME record, no
+/// address records, so the answer carries no IP.
+fn make_cname_only_response(ttl: u32) -> Vec<u8> {
+    let ttl_bytes = ttl.to_be_bytes();
+    vec![
+        0x00,
+        0x00, // ID (matches the query built by build_dns_query)
+        0x81,
+        0x80, // Flags: QR=1, RD=1, RA=1
+        0x00,
+        0x01, // QDCOUNT
+        0x00,
+        0x01, // ANCOUNT
+        0x00,
+        0x00, // NSCOUNT
+        0x00,
+        0x00, // ARCOUNT
+        0x07,
+        b'e',
+        b'x',
+        b'a',
+        b'm',
+        b'p',
+        b'l',
+        b'e',
+        0x03,
+        b'c',
+        b'o',
+        b'm',
+        0x00,
+        0x00,
+        0x01, // QTYPE A
+        0x00,
+        0x01, // QCLASS IN
+        0xc0,
+        0x0c, // NAME pointer to offset 12
+        0x00,
+        0x05, // TYPE CNAME
+        0x00,
+        0x01, // CLASS IN
+        ttl_bytes[0],
+        ttl_bytes[1],
+        ttl_bytes[2],
+        ttl_bytes[3], // TTL
+        0x00,
+        0x13, // RDLENGTH: 19 bytes of CNAME target name
+        0x05,
+        b'a',
+        b'l',
+        b'i',
+        b'a',
+        b's',
+        0x07,
+        b'e',
+        b'x',
+        b'a',
+        b'm',
+        b'p',
+        b'l',
+        b'e',
+        0x03,
+        b'c',
+        b'o',
+        b'm',
+        0x00, // RDATA: alias.example.
+    ]
+}
+
 /// Build an A-record query for example.com (same as what prefetch uses).
 fn make_a_query() -> Vec<u8> {
     build_dns_query("example.com", 1)
 }
 
 /// Build an NXDOMAIN response preserving the query question and carrying an
-/// authority SOA whose TTL and MINIMUM determine the negative cache lifetime.
+/// authority SOA.
 pub(crate) fn make_nxdomain_response(query: &[u8], soa_ttl: u32, soa_minimum: u32) -> Vec<u8> {
     let mut response = query.to_vec();
     response[2] = 0x81;
@@ -400,7 +468,7 @@ mod asis_transport;
 mod cache_routing;
 #[cfg(feature = "native-api")]
 mod diagnostic;
-mod family_and_negative;
+mod family_and_failures;
 mod rule_pipeline;
 mod service_flush;
 mod singleflight;

@@ -1714,7 +1714,7 @@ async fn get_dns_query(
         .await;
     match result {
         Ok(resp) => Json(doh::response_json(&name, qtype, &resp)).into_response(),
-        // Upstream error or negative-cache hit: report SERVFAIL-style.
+        // Upstream error: report SERVFAIL-style.
         Err(e) => {
             tracing::debug!("/dns/query {} type {} failed: {:#}", name, qtype, e);
             Json(serde_json::json!({
