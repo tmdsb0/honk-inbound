@@ -471,9 +471,10 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
     /// conservative 1252-byte default. A detour hands back whole UDP
     /// datagrams inside the front node's *stream* transport (the stream is
     /// segmented by TCP, so the datagram itself is not shrunk), and real
-    /// peers answer a 1200-byte Initial with a 1280-byte handshake flight.
-    /// At 1252 the adapter has to drop that reply and the handshake stalls
-    /// until its deadline. 1350 matches the cap MASQUE h3 detours already use.
+    /// peers answer a 1200-byte Initial with a handshake flight larger than
+    /// the textbook 1280 bytes — a Cloudflare edge sent 1425. At 1252 the
+    /// adapter has to drop that reply and the handshake stalls until its
+    /// deadline. The cap matches the one MASQUE h3 detours already use.
     async fn detour_handshake(
         &self,
         detour: &crate::proxy::detour::DetourPath,

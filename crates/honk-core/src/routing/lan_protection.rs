@@ -51,15 +51,19 @@ impl Router {
 
 fn non_dns_ports_match(ranges: &[PortRange]) -> Option<bool> {
     // Partial unions remain unconfirmed rather than growing a second policy solver.
+    // DNS is port 53 and DNS-over-TLS is port 853; both are excluded here.
     let covers = |start, end| {
         ranges
             .iter()
             .any(|range| range.contains(start) && range.contains(end))
     };
-    if covers(1, 52) && covers(54, u16::MAX) {
+    if covers(1, 52) && covers(54, 852) && covers(854, u16::MAX) {
         Some(true)
     } else if ranges.iter().all(|range| {
-        range.start > range.end || range.end == 0 || (range.start == 53 && range.end == 53)
+        range.start > range.end
+            || range.end == 0
+            || (range.start == 53 && range.end == 53)
+            || (range.start == 853 && range.end == 853)
     }) {
         Some(false)
     } else {
@@ -174,6 +178,43 @@ mod tests {
                 "block",
             );
             check(&[block, local_rule()], fallback, &[(address, expected)]);
+        }
+    }
+
+    #[test]
+    fn dot_853_is_a_dns_port_for_lan_self_protection() {
+        let ipv4 = "192.168.50.1".parse().unwrap();
+        let ipv6 = "fd00:50::1".parse().unwrap();
+        // (a) The gateway LAN rule excludes both DNS (53) and DoT (853) from
+        // the direct(must) coverage: it must confirm for both families.
+        let mut dns_excluded = local_rule();
+        dns_excluded.condition.not.port = vec!["53".into(), "853".into()];
+        check(&[dns_excluded], "block", &[(ipv4, true), (ipv6, true)]);
+        // (b) A dport(853) block rule ahead of the LAN rule is DNS-only
+        // traffic, so it cannot intercept LAN traffic and is skipped.
+        let dot = rule(
+            RoutingCondition {
+                port: vec!["853".into()],
+                ..Default::default()
+            },
+            "block",
+        );
+        check(&[dot, local_rule()], "block", &[(ipv4, true)]);
+        // Boundaries under the widened DNS set: covering every non-DNS port
+        // still confirms, while a DNS-only (853) direct rule does not.
+        for (ports, expected) in [
+            (vec!["1-52", "54-852", "854-65535"], true),
+            (vec!["853"], false),
+            (vec!["53", "853"], false),
+        ] {
+            let candidate = rule(
+                RoutingCondition {
+                    port: ports.into_iter().map(str::to_owned).collect(),
+                    ..Default::default()
+                },
+                "direct",
+            );
+            check(&[candidate], "block", &[(ipv4, expected)]);
         }
     }
 

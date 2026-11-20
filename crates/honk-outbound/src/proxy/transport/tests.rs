@@ -38,14 +38,19 @@ fn transport_node(port: u16) -> Node {
         address: format!("127.0.0.1:{port}"),
         host: "127.0.0.1".into(),
         port,
-        outbound: honk_config::node::OutboundConfig::Trojan(Default::default()),
+        outbound: honk_config::node::OutboundConfig::Trojan(honk_config::node::TrojanConfig {
+            password: Some("secret".into()),
+            ..Default::default()
+        }),
         ..Default::default()
     }
 }
 
 #[tokio::test]
 async fn test_ws_transport_roundtrip() {
-    ws_transport_roundtrip("/ws-path", "/ws-path").await;
+    for with_headers in [false, true] {
+        ws_transport_roundtrip("/ws-path", "/ws-path", with_headers).await;
+    }
 }
 
 #[tokio::test]
@@ -58,14 +63,14 @@ async fn ws_transport_encodes_path_and_preserves_query() {
         ("/existing%20path?ed=2048", "/existing%20path?ed=2048"),
         ("/雪?q=a b", "/%E9%9B%AA?q=a%20b"),
     ] {
-        ws_transport_roundtrip(path, expected).await;
+        ws_transport_roundtrip(path, expected, true).await;
     }
 }
 
 // The accept callback's Result type (and its large Err variant) is
 // dictated by tungstenite's `Callback` trait.
 #[allow(clippy::result_large_err)]
-async fn ws_transport_roundtrip(path: &str, expected: &str) {
+async fn ws_transport_roundtrip(path: &str, expected: &str, with_headers: bool) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
@@ -77,13 +82,22 @@ async fn ws_transport_roundtrip(path: &str, expected: &str) {
         let callback =
             |req: &tokio_tungstenite::tungstenite::handshake::server::Request,
              resp: tokio_tungstenite::tungstenite::handshake::server::Response| {
-                let host = req
-                    .headers()
-                    .get("host")
-                    .and_then(|v| v.to_str().ok())
-                    .map(str::to_string);
+                let header = |name: &str| {
+                    req.headers()
+                        .get(name)
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_string)
+                };
+                let host = header("host");
+                let user_agent = header("user-agent");
+                let x_test = header("x-test");
                 if let Some(tx) = seen_tx.take() {
-                    let _ = tx.send((req.uri().path_and_query().unwrap().to_string(), host));
+                    let _ = tx.send((
+                        req.uri().path_and_query().unwrap().to_string(),
+                        host,
+                        user_agent,
+                        x_test,
+                    ));
                 }
                 Ok(resp)
             };
@@ -104,6 +118,15 @@ async fn ws_transport_roundtrip(path: &str, expected: &str) {
     transport.transport = "ws".into();
     transport.ws_path = Some(path.into());
     transport.ws_host = Some("cdn.example.com".into());
+    if with_headers {
+        transport.ws_headers.insert(
+            "user-agent".into(),
+            "Mozilla/5.0 (X11; Linux x86_64)".into(),
+        );
+        transport
+            .ws_headers
+            .insert("x-test".into(), "ws-header".into());
+    }
 
     let mut stream = wrap_transport(&node, None, std::time::Duration::from_secs(3), None)
         .await
@@ -121,9 +144,14 @@ async fn ws_transport_roundtrip(path: &str, expected: &str) {
     .unwrap();
     assert_eq!(&buf, b"pong");
 
-    let (path, host) = seen_rx.await.unwrap();
+    let (path, host, user_agent, x_test) = seen_rx.await.unwrap();
     assert_eq!(path, expected);
     assert_eq!(host.as_deref(), Some("cdn.example.com"));
+    assert_eq!(
+        user_agent.as_deref(),
+        with_headers.then_some("Mozilla/5.0 (X11; Linux x86_64)")
+    );
+    assert_eq!(x_test.as_deref(), with_headers.then_some("ws-header"));
 
     server.await.unwrap();
 }
@@ -240,4 +268,107 @@ async fn websocket_request_event_waits_for_real_frame_flush() {
             assert!(bridge.await.unwrap_err().is_cancelled());
         }
     }
+}
+
+/// A CDN-fronted node names the edge IP as its address and the distribution
+/// only in the WebSocket `Host` header; SNI must follow the header or the
+/// edge answers with a certificate that cannot match the address.
+#[test]
+fn ws_tls_server_name_prefers_the_host_header() {
+    let mut node = transport_node(443);
+    node.tls_mut().unwrap().enabled = true;
+    node.transport_mut().unwrap().transport = "ws".into();
+    assert_eq!(tls_server_name(&node), "127.0.0.1");
+
+    node.transport_mut().unwrap().ws_host = Some("cdn.example".into());
+    assert_eq!(tls_server_name(&node), "cdn.example");
+
+    node.transport_mut().unwrap().ws_host = Some("cdn.example:8443".into());
+    assert_eq!(tls_server_name(&node), "cdn.example");
+
+    node.transport_mut().unwrap().ws_host = Some("[2001:db8::1]:8443".into());
+    assert_eq!(tls_server_name(&node), "2001:db8::1");
+
+    node.transport_mut().unwrap().ws_host = Some(String::new());
+    assert_eq!(tls_server_name(&node), "127.0.0.1");
+
+    node.tls_mut().unwrap().sni = Some("sni.example".into());
+    assert_eq!(tls_server_name(&node), "sni.example");
+
+    node.tls_mut().unwrap().sni = None;
+    node.transport_mut().unwrap().transport = "grpc".into();
+    node.transport_mut().unwrap().ws_host = Some("cdn.example".into());
+    assert_eq!(tls_server_name(&node), "127.0.0.1");
+}
+
+/// A CDN-fronted XHTTP node names the edge IP as its address and the
+/// distribution only in the XHTTP `host` option; SNI must follow the host
+/// or the edge answers with a certificate that cannot match the address.
+#[test]
+fn xhttp_tls_server_name_prefers_the_host_header() {
+    let mut node = transport_node(443);
+    node.tls_mut().unwrap().enabled = true;
+    node.transport_mut().unwrap().transport = "xhttp".into();
+    node.transport_mut().unwrap().xhttp = Some(Default::default());
+    assert_eq!(tls_server_name(&node), "127.0.0.1");
+
+    node.transport_mut().unwrap().xhttp.as_mut().unwrap().host = Some("cdn.example".into());
+    assert_eq!(tls_server_name(&node), "cdn.example");
+
+    node.transport_mut().unwrap().xhttp.as_mut().unwrap().host = Some("cdn.example:8443".into());
+    assert_eq!(tls_server_name(&node), "cdn.example");
+
+    node.transport_mut().unwrap().xhttp.as_mut().unwrap().host = Some("[2001:db8::1]:8443".into());
+    assert_eq!(tls_server_name(&node), "2001:db8::1");
+
+    node.transport_mut().unwrap().xhttp.as_mut().unwrap().host = Some(String::new());
+    assert_eq!(tls_server_name(&node), "127.0.0.1");
+
+    node.tls_mut().unwrap().sni = Some("sni.example".into());
+    assert_eq!(tls_server_name(&node), "sni.example");
+
+    node.tls_mut().unwrap().sni = None;
+    node.transport_mut().unwrap().transport = "grpc".into();
+    node.transport_mut().unwrap().xhttp.as_mut().unwrap().host = Some("cdn.example".into());
+    assert_eq!(tls_server_name(&node), "127.0.0.1");
+}
+
+/// The download peer is the node cloned onto its own endpoint; its SNI must
+/// follow the download `host`, not the download address, and an explicit
+/// download `server_name` still wins.
+#[test]
+fn xhttp_download_view_server_name_prefers_the_download_host() {
+    let mut node = transport_node(443);
+    node.tls_mut().unwrap().enabled = true;
+    let transport = node.transport_mut().unwrap();
+    transport.transport = "xhttp".into();
+    transport.xhttp = Some(honk_config::node::XhttpOptions {
+        host: Some("up.example".into()),
+        download: Some(Box::new(honk_config::node::XhttpDownload {
+            address: "203.0.113.7".into(),
+            port: 443,
+            server_name: None,
+            host: Some("dl.example".into()),
+            path: "/down/".into(),
+            x_padding_bytes: honk_config::node::XhttpRange {
+                min: 100,
+                max: 1000,
+            },
+        })),
+        ..Default::default()
+    });
+    let view = node.xhttp_download_view().unwrap();
+    assert_eq!(tls_server_name(&view), "dl.example");
+
+    node.transport_mut()
+        .unwrap()
+        .xhttp
+        .as_mut()
+        .unwrap()
+        .download
+        .as_mut()
+        .unwrap()
+        .server_name = Some("dl-sni.example".into());
+    let view = node.xhttp_download_view().unwrap();
+    assert_eq!(tls_server_name(&view), "dl-sni.example");
 }

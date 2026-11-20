@@ -1600,7 +1600,7 @@ dependencies = [
 
 [[package]]
 name = "honk-config"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "base64 0.23.1",
  "chrono",
@@ -1625,7 +1625,7 @@ dependencies = [
 
 [[package]]
 name = "honk-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "aes-gcm",
  "aho-corasick",
@@ -1705,7 +1705,7 @@ dependencies = [
 
 [[package]]
 name = "honk-ebpf-common"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "aya",
  "aya-ebpf-bindings",
@@ -1714,7 +1714,7 @@ dependencies = [
 
 [[package]]
 name = "honk-nfqueue"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "bytes",
  "libc",
@@ -1725,7 +1725,7 @@ dependencies = [
 
 [[package]]
 name = "honk-outbound"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -1782,7 +1782,7 @@ dependencies = [
 
 [[package]]
 name = "honk-tool"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "clap",

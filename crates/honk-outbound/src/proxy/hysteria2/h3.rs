@@ -67,7 +67,7 @@ pub(super) fn read_prefixed_int(
 
 /// `(code, bit length)` for symbols 0..=255 plus EOS (256), mirrored from
 /// RFC 7541 Appendix B (x/net `http2/hpack/tables.go`).
-pub(super) const HUFFMAN_TABLE: [(u32, u8); 257] = [
+pub(crate) const HUFFMAN_TABLE: [(u32, u8); 257] = [
     (0x1ff8, 13),
     (0x7fffd8, 23),
     (0xfffffe2, 28),
@@ -326,6 +326,16 @@ pub(super) const HUFFMAN_TABLE: [(u32, u8); 257] = [
     (0x3ffffee, 26),
     (0x3fffffff, 30),
 ];
+
+/// HPACK Huffman-encoded length of `bytes` in whole bytes: the bit lengths
+/// summed, then rounded up, matching Go's `hpack.HuffmanEncodeLength`.
+pub(crate) fn huffman_encoded_len(bytes: &[u8]) -> usize {
+    let bits: usize = bytes
+        .iter()
+        .map(|&byte| HUFFMAN_TABLE[byte as usize].1 as usize)
+        .sum();
+    bits.div_ceil(8)
+}
 
 /// Decoding trie: each node is `[zero, one]`; `0` = empty, `0x8000 | sym` =
 /// leaf, anything else = child node index.

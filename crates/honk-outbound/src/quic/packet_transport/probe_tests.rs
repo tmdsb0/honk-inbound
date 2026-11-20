@@ -1,4 +1,4 @@
-use super::super::{QuicClientOptions, client_config, testutil};
+use super::super::{FRONTED_UDP_PAYLOAD_SIZE, QuicClientOptions, client_config, testutil};
 use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -163,6 +163,41 @@ impl PacketTransport for UdpPacketTransport {
     async fn recv_packet(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         Ok((self.socket.recv(buf).await?, self.remote))
     }
+}
+
+#[tokio::test]
+async fn fronted_cap_carries_observed_1425_byte_handshake_datagram() {
+    // A real edge answered a fronted handshake with one 1425-byte datagram
+    // (Initial + Handshake, certificate chain included). quinn sizes its
+    // receive buffers from the endpoint's advertised max UDP payload size,
+    // so the adapter buffer here is the fronted cap itself: below 1425 the
+    // datagram is dropped in `poll_recv` and the handshake stalls.
+    let remote: SocketAddr = "127.0.0.1:443".parse().unwrap();
+    let socket = TransportQuinnSocket::new(
+        Arc::new(SequencePacketTransport {
+            remote,
+            packets: Mutex::new(std::collections::VecDeque::from([(
+                vec![0u8; 1425],
+                remote,
+            )])),
+            full_cone: false,
+        }),
+        remote,
+    );
+    let mut data = vec![0u8; FRONTED_UDP_PAYLOAD_SIZE as usize];
+    let mut meta = [quinn::udp::RecvMeta::default()];
+    let received = tokio::time::timeout(
+        Duration::from_secs(1),
+        std::future::poll_fn(|cx| {
+            let mut bufs = [std::io::IoSliceMut::new(&mut data[..])];
+            quinn::AsyncUdpSocket::poll_recv(&*socket, cx, &mut bufs, &mut meta)
+        }),
+    )
+    .await
+    .expect("1425-byte datagram was dropped instead of delivered")
+    .unwrap();
+    assert_eq!(received, 1);
+    assert_eq!(meta[0].len, 1425);
 }
 
 #[tokio::test]

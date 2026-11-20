@@ -1160,19 +1160,18 @@ impl OutboundRuntimeRegistry {
 
     /// Sticky task failure status for this generation's retained ownership.
     pub fn tasks_failed(&self) -> bool {
-        if std::sync::LazyLock::get(&self.background_tasks).is_some_and(|owner| owner.has_failed())
-        {
-            return true;
-        }
-        #[cfg(feature = "owned-tasks")]
-        {
-            let moved_out = self.moved_out.lock();
-            self.nodes
-                .iter()
-                .any(|(id, runtime)| !moved_out.contains(id) && runtime.tasks_failed())
-        }
-        #[cfg(not(feature = "owned-tasks"))]
-        false
+        std::sync::LazyLock::get(&self.background_tasks).is_some_and(|owner| owner.has_failed())
+            || {
+                #[cfg(feature = "owned-tasks")]
+                {
+                    let moved_out = self.moved_out.lock();
+                    self.nodes
+                        .iter()
+                        .any(|(id, runtime)| !moved_out.contains(id) && runtime.tasks_failed())
+                }
+                #[cfg(not(feature = "owned-tasks"))]
+                false
+            }
     }
 
     /// Make the generation unavailable to new generation-owned work without

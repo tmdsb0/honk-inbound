@@ -76,7 +76,7 @@ const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
 /// Close the shared QUIC connection after this long without open streams.
 const CONN_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
-mod h3;
+pub(crate) mod h3;
 mod salamander;
 #[cfg(test)]
 mod tests;

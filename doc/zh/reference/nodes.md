@@ -70,6 +70,8 @@ protocol|host|port|credential-fingerprint|dial-shape
 
 XHTTP 身份还包含有效的 TLS/明文安全配置，以及全部已接受的规范 XHTTP 参数，包括标头、填充和 POST 间隔。输入别名、标头名称大小写与等价范围表示会在派生前规范化。新增 XHTTP 不改变已有 TCP/WS/gRPC 身份材料。
 
+WebSocket 身份还包含非空的规范标头映射。标头名称大小写、插入顺序和等值别名不改变身份；值不同则改变。映射为空或缺失时保持原有身份。
+
 拼接前，每个原始凭据字段、拨号形态字段和有效的 `host` 值都会将 `\` 转义为 `\\`，将 `|` 转义为 `\|`。拼接后的指纹不再转义。对于通过 `Config::validate` 的节点，不同的身份字段会产生不同的哈希输入。完整配置校验拒绝的节点不在此保证范围内，即使 `Node::from_share_link` 能为其派生 ID。
 
 **破坏性升级：**所有成功重新派生身份的 VLESS 节点都会获得新 ID，包括从未填写 `vless_mode`、关闭 UDP 或设置 ALPN 的节点。以 ID 为键的健康、预热及会话状态会重新建立。其他协议仅在上述以 `|` 拼接的身份字段中含有 `|` 或 `\` 时变更 ID；ALPN 使用独立的 JSON 子 UUID 步骤，仅 ALPN 含有这些字符不触发该变化。
@@ -121,6 +123,7 @@ Node 模型包含下列字段。分享链接从协议方案、用户信息、地
 | `flow` | string? | null | VLESS `xtls-rprx-vision` 或 `xtls-rprx-vision-udp443`；Shadowrocket `xtls=2` 选择基础 flow |
 | `network` | string? | null | 受支持协议的数据包网络能力；与 VMess JSON `net` 等流传输字段独立 |
 | `ws_path` / `ws_host` | string? | null | WebSocket `path` 与 Host 标头 |
+| `ws_headers` | object | `{}`；输出时省略 | 额外的升级标头字符串映射，名称规范化为小写；等值别名合并，冲突别名拒绝。最多 64 项，名称加值共 16 KiB；控制字符拒绝。保留名称：`host`、`connection`、`upgrade`、`sec-websocket-key`、`sec-websocket-version`、`sec-websocket-extensions`、`sec-websocket-accept`、`sec-websocket-protocol`、`content-length`、`transfer-encoding`。非 WebSocket 流传输携带非空映射会被拒绝；没有流传输的协议会丢弃该字段。Null 无效。只有订阅与结构化输入能提供标头；任何分享链接方言都不携带。 |
 | `grpc_service` | string? | null | gRPC `serviceName` 或 `service_name` |
 | `xhttp` | object? | 省略 | flat 结构化输入/输出中的规范 XHTTP 参数；其他传输携带该对象会被拒绝 |
 | `hy2_auth` / `hy2_obfs` | string? | null | Hysteria2 认证与 salamander 密码 |
@@ -294,7 +297,7 @@ Shadowsocks UDP（传统 AEAD 与 2022）为每个客户端源的所有目的地
 | 值 | 传输方式 | 字段映射 |
 | --- | --- | --- |
 | 空文本或 `tcp` | 裸 TCP | — |
-| `ws` | WebSocket | `path` → `ws_path`；`host` → `ws_host` |
+| `ws` | WebSocket | `path` → `ws_path`；`host` → `ws_host`；升级标头没有分享链接字段 |
 | `grpc` | gRPC | `serviceName` 或 `service_name` → `grpc_service` |
 | `xhttp` 或输入别名 `splithttp` | XHTTP | 见下文的 H2 兼容范围。 |
 
@@ -373,6 +376,11 @@ URI `extra` 接受百分号编码的 JSON 对象，可含 `host`、`path`、`mod
 | `noGRPCHeader` | `no_grpc_header` | `false` | 布尔值 |
 | `scMaxEachPostBytes` | `sc_max_each_post_bytes` | `1000000` | 1–16777216 字节 |
 | `scMinPostsIntervalMs` | `sc_min_posts_interval_ms` | `30` | 0–60000 ms；零关闭最小间隔 |
+| `xPaddingObfsMode` | `x_padding_obfs_mode` | `false` | 布尔值；为 true 且 method、placement、header、key 齐全时，拨号器发送混淆填充代替 Referer 填充 |
+| `xPaddingMethod` | `x_padding_method` | 未指定 | `repeat-x` 或 `tokenish` |
+| `xPaddingPlacement` | `x_padding_placement` | 未指定 | `queryInHeader`、`cookie`、`header`、`query`、`path`、`body` 或 `auto` |
+| `xPaddingHeader` | `x_padding_header` | 未指定 | 承载填充的非空请求头名 |
+| `xPaddingKey` | `x_padding_key` | 未指定 | 承载填充的非空查询键 |
 
 结构化范围接受无符号标量、`min-max` 字符串或 `{"min":N,"max":N}`。Header 名称规范化为小写，等价别名合并；冲突别名、控制字符与传输层管理的标头（`host`、`content-type`、`content-length`、`referer`、hop-by-hop 标头、trailers）会被拒绝。URI/VMess extra JSON 在转为 map 前拒绝重复成员。Padding 始终启用。这些范围是本地安全上限，不保证每个对端或 CDN 都接受。
 
@@ -397,7 +405,7 @@ CDN 的机器人过滤规则可能拒绝不含这些请求头的 XHTTP 请求。
 | Extra 中的 `noSSEHeader`、`scMaxBufferedPosts`、`scStreamUpServerSecs` | 仅作用于 Xray 服务端，检查类型后丢弃。 |
 | `xmux` | 仅在全为零或恰好等于 Xray 的缺省 XMUX 填充值时接受并丢弃：`maxConcurrency` 为 1、`hMaxRequestTimes` 为 600–900、`hMaxReusableSecs` 为 1800–3000，其余为 0。其他值拒绝。 |
 
-未知或不支持的参数会使整个节点被拒绝，即使值为 null 或空值也不例外。这包括其他会话、序号或载荷位置、自定义上传方法和填充混淆配置。Mihomo 订阅使用对应的 `xhttp-opts` 字段。官方 sing-box 和客户端记录格式仍不支持 XHTTP 传输。
+未知或不支持的参数会使整个节点被拒绝，即使值为 null 或空值也不例外。这包括其他会话、序号或载荷位置和自定义上传方法。Mihomo 订阅使用对应的 `xhttp-opts` 字段。官方 sing-box 和客户端记录格式仍不支持 XHTTP 传输。
 
 Extra 中的 `downloadSettings` 是 Xray StreamConfig，将 GET 发往独立端点。下载端不继承上传端的任何设置，包括请求头。因此，即使上传端配置了 `User-Agent`，下载 GET 仍携带默认的 Chrome `fetch()` 请求头。
 
@@ -436,7 +444,7 @@ XHTTP 禁止 TCP Mux.Cool，但保留 UDP-only XUDP 承载连接。已有 VLESS 
 
 TLS/REALITY、flow 或传输声明相互冲突时会拒绝链接，不会静默降级。VLESS 的 `obfs` 仅接受空值/`none`、`websocket` 或 `grpc`，不会把不支持的传输方式当作 TCP。`host` 和 `serviceName`/`service_name` 保留原有回退顺序。显式 SNI 别名在赋值前按原始字节比较：相同值合并，不同值报错，不转换大小写。空值或纯空白的 SNI 和 flow 在派生节点 ID 前规范化为未指定；非空 flow 必须为 `xtls-rprx-vision` 或 `xtls-rprx-vision-udp443`。
 
-Clash 导入会比较 `servername`、`server-name` 和 `sni`；记录格式还会比较 `tls-name` 和 `tls-host`，并保留较低优先级的 `obfs_sni` 回退值，包括 Quantumult X 的 WSS Host。记录中的 `off` 仍为无效值。分享链接和 VMess JSON 的 WebSocket `host` 仅用作 Host 请求头；非 WebSocket 传输则将其作为较低优先级的 SNI 回退值。TLS 使用方最终仍可回退到节点主机名。
+Clash 导入会比较 `servername`、`server-name` 和 `sni`；记录格式还会比较 `tls-name` 和 `tls-host`，并保留较低优先级的 `obfs_sni` 回退值，包括 Quantumult X 的 WSS Host。记录中的 `off` 仍为无效值。分享链接和 VMess JSON 的 WebSocket `host` 只存为 Host 请求头；非 WebSocket 传输则将其作为较低优先级的 SNI 回退值。拨号时普通 TLS 连接有显式 `sni` 就发它，否则发去掉端口后的非空 WebSocket `Host` 或 XHTTP `host`，最后才发节点主机名；CDN 前置节点因此校验请求头里命名的分发证书，而不是它的边缘地址。
 
 ### Hysteria2
 

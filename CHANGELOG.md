@@ -6,6 +6,35 @@ This changelog follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) 
 
 Entries live in [changes/](changes/) until release.
 
+## [0.2.1] - 2026-11-20
+
+### Changed
+
+- Bump the embedded doona panel to 0.1.0 (revision 60de171b), which lets manually added XHTTP nodes carry the five obfuscation padding fields.
+
+### Fixed
+
+- Clash and sing-box subscriptions import WebSocket upgrade headers other than `Host`, so nodes that require `ws-opts.headers.User-Agent` are no longer dropped. The headers participate in node identity and are sent on the upgrade.
+- Direct and supplied-TCP WebSocket dials enforce the same header limits and reserved-name rules as subscription admission, before network I/O.
+- sing-box keeps empty WebSocket header strings and rejects invalid or conflicting claims instead of silently dropping them.
+- Structured node errors retain the actual transport or header field instead of being mislabeled as XHTTP errors.
+- Clash WebSocket Host extraction retains its first-usable scalar and lazy fallback behavior while additional headers remain strictly checked.
+- Subscription stream-normalization failures retain their canonical field alongside the original entry index, preserving transport context without exposing supplied header names or values.
+- honk-core loads its eBPF programs on Linux 7.4 again; the 7.4 verifier rejected how packet headers were copied.
+- Fronted QUIC connections stop dropping oversized handshake datagrams: the fronted UDP payload cap grows from 1350 to 1452 bytes, so a 1425-byte handshake flight from a real edge (e.g. Cloudflare) is delivered instead of discarded and the handshake no longer stalls.
+- LAN self-protection checks stop misreporting rules that exclude or match DNS-over-TLS port 853: 853 now counts as a DNS port alongside 53, so a `!dport(53, 853)` direct rule confirms and a `dport(853)` block rule is correctly skipped instead of failing the check.
+- Kernel route trace keeps decoding rule hits on large policies: the per-policy and retained rule-text dictionary budgets grow from 64 KiB / 1 MiB to 128 KiB / 2 MiB; an oversized dictionary previously turned kernel route tracing off, with a warning at startup and reload.
+- Routing traces from the native API (`POST /api/v1/routing/trace`) no longer fail with `413 request_too_large` on larger policies; the step limit now covers the whole loaded policy.
+- Plain-TLS dials send the WebSocket `Host` name as SNI when no explicit `sni` is set, so CDN-fronted nodes verify the distribution certificate instead of failing on the edge address.
+- XHTTP nodes carrying Xray obfs padding claims (`xPaddingObfsMode`, `xPaddingMethod`, `xPaddingPlacement`, `xPaddingHeader`, `xPaddingKey`) import instead of being rejected as malformed, so edgetunnel XHTTP links work; the claims are stored but do not yet shape requests.
+- XHTTP nodes with obfs padding configured now send the padding (queryInHeader, header, query or cookie placement) instead of the standard Referer padding, so edgetunnel-style endpoints that route on the padding header can be reached.
+- Plain-TLS dials send the XHTTP `host` name as SNI when no explicit `sni` is set, so CDN-fronted XHTTP nodes verify the distribution certificate instead of failing on the edge address.
+
+### Internal
+
+- Fix the `needless_bool` Clippy finding in the generation task-failure check so the outbound gate passes with `owned-tasks` off.
+- Bump the Rust toolchain pin from 1.99.1 to 1.100 and fix the `needless_range_loop` finding the new clippy reports in the reload tests.
+
 ## [0.2.0] - 2026-11-17
 
 ### Added
@@ -174,7 +203,8 @@ Summarised from the [release notes](https://github.com/daeuniverse/honk/releases
 - Shared UDP sources survive malformed SOCKS5, Trojan and Juicity datagrams.
 - QUIC session tickets honour `skip_cert_verify`, and a reload restores warm carriers and probes.
 
-[Unreleased]: https://github.com/daeuniverse/honk/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/daeuniverse/honk/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/daeuniverse/honk/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/daeuniverse/honk/compare/v0.1.0-beta.4...v0.2.0
 [0.1.0-beta.4]: https://github.com/daeuniverse/honk/compare/v0.1.0-beta.3...v0.1.0-beta.4
 [0.1.0-beta.3]: https://github.com/daeuniverse/honk/compare/v0.1.0-beta.2...v0.1.0-beta.3

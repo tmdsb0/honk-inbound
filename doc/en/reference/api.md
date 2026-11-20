@@ -330,11 +330,11 @@ Per-flow condition expressions use configured source spelling cached with the co
 
 For handed-off traffic, kernel rule outcomes come from the compiled program's own branch witness, not userspace re-evaluation. UDP additionally requires the received packet's capture ID. Tuple, decision token, routing generation and action must agree with the retained witness.
 
-A later tuple incarnation cannot supply an older packet's evidence. Capture IDs do not wrap. Frozen dictionaries retain at most 16 policies, 64 KiB each and 1 MiB total within the recorder reservation.
+A later tuple incarnation cannot supply an older packet's evidence. Capture IDs do not wrap. Frozen dictionaries retain at most 16 policies, 128 KiB each and 2 MiB total within the recorder reservation.
 
 Dictionary rejection/eviction, missing witnesses, ambiguous TCP association and executed overflow beyond 256 rule/condition values produce partial evidence. Unexecuted rules beyond that value ceiling alone do not imply lost execution.
 
-If a policy’s kernel trace dictionary would exceed 64 KiB, honk publishes it with kernel route tracing off and logs a warning. This applies at startup and on reload. Its flows report `kernel_trace_not_captured` rather than undecodable witnesses. The check sizes rule identifiers for the longest generation number, so a policy right at the bound may already be published untraced.
+If a policy’s kernel trace dictionary would exceed 128 KiB, honk publishes it with kernel route tracing off and logs a warning. This applies at startup and on reload. Its flows report `kernel_trace_not_captured` rather than undecodable witnesses. The check sizes rule identifiers for the longest generation number, so a policy right at the bound may already be published untraced.
 
 Native extension fields retain source detail without inventing identities: route input may include `ingress`, `domain_fact_bitmap` and `domain_fact_state` rather than fabricated domain rule IDs. DNS-related outbound/connection steps carry `lookup_id`, and known physical peers carry `server_addr`. Selection facts include the health family and whether a decision was applied or only peeked.
 
@@ -854,7 +854,7 @@ It does not resolve DNS, dial, probe or mutate group selection. `resolve` defaul
 
 Violating that shape returns 400, while a well-shaped live request returns 422 because live resolution is unsupported. Content-Type, JSON/schema, input and resolve checks precede rate admission. Rejected validation consumes no trace-rate slot.
 
-Limits are one address, 256 rule/condition steps, five seconds and 30 requests/minute for the sole principal and globally.
+Limits are one address, five seconds and 30 requests/minute for the sole principal and globally. The step limit, advertised as `routing_trace.max_rule_steps`, is the larger of 4096 and the loaded policy's cost (1 plus, for each rule, 1 plus its condition count), so every loaded policy can be traced.
 
 The response is a `simulation` pinned to one `instance_id` and `generation_id`, not historical flow evidence. `/rules` returns the complete dictionary including fallback, never truncated. `max_rules` is 4096 or the running dictionary size if larger, and `dns_rules.max_rules` likewise covers the larger DNS list.
 

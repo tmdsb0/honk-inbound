@@ -678,8 +678,9 @@ impl PacketTransportEndpoint {
 /// Every fronted QUIC path uses [`crate::quic::FRONTED_UDP_PAYLOAD_SIZE`]:
 /// Hysteria2 / TUIC / Juicity detour dials (via `QuicClient::detour_handshake`)
 /// and both direct and fronted MASQUE h3 tunnels. A MASQUE connect-ip tunnel
-/// sends one whole 1280-byte IP packet per QUIC DATAGRAM, which needs about
-/// 1350 bytes with QUIC/H3 overhead. A detour frames that datagram inside the
+/// sends one whole 1280-byte IP packet per QUIC DATAGRAM, which needs up to
+/// 1452 bytes with QUIC/H3 overhead (a real edge sent a 1425-byte handshake
+/// flight). A detour frames that datagram inside the
 /// front node's stream transport; TCP segments the stream, so the datagram is
 /// neither enlarged nor shrunk. `endpoint_config_with_mtu` clamps to quinn's
 /// legal range.

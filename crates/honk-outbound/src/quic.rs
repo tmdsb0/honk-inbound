@@ -83,12 +83,16 @@ const DEFAULT_BBR: BbrVariant = BbrVariant::V3;
 ///
 /// A detour hands back whole UDP datagrams inside the front node's stream
 /// transport; TCP segments that stream, so the datagram itself is not shrunk.
-/// Peers answer a 1200-byte Initial with a 1280-byte handshake flight, and a
-/// MASQUE connect-ip tunnel needs room for one whole 1280-byte TUN IP packet,
-/// so the conservative 1252-byte direct-socket default is too small here.
-/// quinn cannot run path MTU discovery through the abstract socket a detour
-/// provides, so fronted configs also pin this value as `initial_mtu`.
-pub(crate) const FRONTED_UDP_PAYLOAD_SIZE: u16 = 1350;
+/// A MASQUE connect-ip tunnel needs room for one whole 1280-byte TUN IP
+/// packet, so the conservative 1252-byte direct-socket default is too small
+/// here. Real edges exceed the textbook 1280-byte handshake flight: a
+/// Cloudflare edge answered with a 1425-byte Initial+Handshake flight, which
+/// a 1350-byte cap drops. 1452 is quinn's path-MTU-discovery upper bound and
+/// the largest IPv6-safe UDP payload under a 1500-byte MTU (1500-48), so it
+/// covers that flight with room to spare. quinn cannot run path MTU
+/// discovery through the abstract socket a detour provides, so fronted
+/// configs also pin this value as `initial_mtu`.
+pub(crate) const FRONTED_UDP_PAYLOAD_SIZE: u16 = 1452;
 
 /// `HONK_QUIC_BBR=v1|v3`, read once; any other value warns and keeps the default.
 static BBR_VARIANT: LazyLock<BbrVariant> = LazyLock::new(|| match std::env::var("HONK_QUIC_BBR") {

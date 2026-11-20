@@ -160,7 +160,7 @@ SIGHUP 时，拉取身份（URL + 配置的 `ua` + 标头）相同的订阅保�
 - HTTP、UTF-8 编码、解析或无可用节点错误不会发布替换节点，也不会写入，因此活动节点与上一次有效正文都会保留。通过校验的正文按原始字节保存，不修复编码。
 - 拉取失败后，首次等待 30 秒与 `interval` 中的较小值，再翻倍退避，最多为 10 分钟与 `interval` 中的较小值；`interval: 0` 禁用自动重试。发布成功或被拒绝都会结束已有退避，恢复正常刷新间隔。
 - 解析成功后，持久化写入失败属于非致命错误。新解析出的节点仍会返回用于发布，原子写入不会保存不完整的正文。下次重启可以恢复磁盘上保留的任一完整有效正文。
-- 不支持或格式错误的节点会逐个跳过。共用节点构建器的警告包含从 1 开始的 proxy 索引和固定拒绝原因，不包含原始记录或凭据。只有没有剩余可用节点时，整个正文才失败；空结果绝不会清空上一代节点。
+- 不支持或格式错误的节点会逐个跳过。共用节点构建器的警告包含从 1 开始的条目索引和固定拒绝原因。流传输规范化失败还会保留规范字段，例如 `proxies[1].xhttp` 或 `outbounds[1].ws_headers`，不暴露提供的标头名称、值或凭据。只有没有剩余可用节点时，整个正文才失败；空结果绝不会清空上一代节点。
 
 上一次有效正文指通过当前导入规则校验的正文，不是最后一次成功发布的运行时配置。部分条目无效但仍有一个可用节点的正文可以替换存储；全部无效的正文不能。恢复时会按当前规则重新解析，因此旧版本保存的正文可能被拒绝。写入成功后，若节点集合校验或发布失败，活动配置保持不变，但磁盘上可能已保存新正文。磁盘与活动配置不属于同一事务。
 
@@ -266,7 +266,7 @@ XHTTP 不受裸 TCP ALPN 规则限制：它始终使用 H2，包括 REALITY 和�
 
 | `xhttp-opts` 字段 | 导入行为 |
 | --- | --- |
-| `path`、`host`、`mode`、`headers`、`x-padding-bytes`、`no-grpc-header`、`sc-max-each-post-bytes`、`sc-min-posts-interval-ms` | 接受。 |
+| `path`、`host`、`mode`、`headers`、`x-padding-bytes`、`no-grpc-header`、`sc-max-each-post-bytes`、`sc-min-posts-interval-ms`、`x-padding-obfs-mode`、`x-padding-method`、`x-padding-placement`、`x-padding-header`、`x-padding-key` | 接受。混淆模式开启且 method、placement、header、key 齐全时，拨号器发送混淆填充代替 Referer 填充；否则回落到 Referer 填充。 |
 | `no-sse-header`、`sc-max-buffered-posts`、`sc-stream-up-server-secs` | 仅服务端使用，检查类型后丢弃。 |
 | `reuse-settings`、`xmux` | 按 Xray 语义遵循 URI `xmux` 规则。Mihomo 则只要存在 `reuse-settings` 就启用自己的复用管理器。 |
 | `download-settings` | 须为 Xray StreamConfig 映射，见下文。 |
@@ -275,7 +275,7 @@ XHTTP 不受裸 TCP ALPN 规则限制：它始终使用 H2，包括 REALITY 和�
 
 Mihomo 自身具有继承语义的键会被拒绝，如 `server`、`servername`、`tls`、`skip-cert-verify`。这与 mihomo 有意不同：mihomo 忽略 Xray 结构的键，将 GET 发往上传服务器。规范默认值、范围和请求头限制见 [XHTTP 节点参考](./nodes.md#h2-上的-xhttp)。
 
-其他不支持的参数，包括其他字段位置和填充混淆设置，只要存在就会使条目被拒绝，即使值为 null、空值或 false。其他有效节点保留。URI/VMess extra JSON 在构造映射前拒绝重复成员。
+其他不支持的参数，包括其他字段位置，只要存在就会使条目被拒绝，即使值为 null、空值或 false。其他有效节点保留。URI/VMess extra JSON 在构造映射前拒绝重复成员。
 
 #### VLESS transport 与 REALITY
 
@@ -291,7 +291,8 @@ VLESS 字段会在派生节点身份前应用：
 | `reality-opts.short-id` | 可选 REALITY short ID。 |
 | `reality-opts.spider-x` | REALITY spider path；缺失或为空时使用 `/`。 |
 | `ws-opts.path` | WebSocket path；回退到扁平别名 `ws-path`。 |
-| `ws-opts.headers.Host` | WebSocket Host 标头，键匹配不区分大小写；依次回退到 scalar `ws-headers`、`ws-host`。 |
+| `ws-opts.headers.Host` | WebSocket Host 标头：第一个非空、不区分大小写的 Host 值获胜；字符串保留原字节，有限数字转为文本。无效或空白的 Host 值会被忽略。依次回退到 scalar `ws-headers`、`ws-host`，仅在前面的值都未获胜时才检查。 |
+| `ws-opts.headers.<name>` | 额外的 WebSocket 升级标头，所有支持 WebSocket 的代理共用，按小写名称导入（例如 `User-Agent`）。Null 值忽略，非标量值会丢弃整个条目；保留的握手标头按[节点字段约定](./nodes.md#节点字段)拒绝该条目。 |
 | `grpc-opts.grpc-service-name` | gRPC service name；回退到 `grpc-service`。 |
 | `client-fingerprint` | 有意不导入。TLS 指纹由进程级 `global.tls_implementation` 与 `global.utls_imitate` 选择。 |
 
@@ -337,10 +338,11 @@ sing-box 配置从 `outbounds` 导入受支持的条目：
 - 代理节点：Shadowsocks、SOCKS5、VMess、VLESS、Trojan、Hysteria2、TUIC、Juicity、AnyTLS。
 - 结构性条目，不属于代理节点：`selector`、`urltest`、`direct`、`block`、`dns`。
 
-TLS/SNI、REALITY、WebSocket/gRPC、VLESS 数据包选项和受支持的协议调优通过共用节点构建器规范化。
+TLS/SNI、REALITY、WebSocket/gRPC（包括非 `Host` 升级标头）、VLESS 数据包选项和受支持的协议调优通过共用节点构建器规范化。
 
 | 来源特有情况 | 导入行为 |
 | --- | --- |
+| WebSocket `transport.headers` | `Host` 仍是专用字符串字段；重复的 Host 别名拒绝。其他字符串值（含空字符串）保留；null 忽略，其他类型拒绝该条目。名称与值遵循[节点标头约定](./nodes.md#节点字段)。 |
 | VLESS 未启用 H2MUX/UoT 封装，且没有显式 `packet_encoding` 选择其他路径 | 使用 Single XUDP 并允许 UDP。这是 sing-box 导入默认值，不是 Auto 的全局含义。 |
 | gRPC 服务名为空或省略 | 保留 sing-box 的空服务名，不使用 honk 的 `GunService` 默认值。 |
 | Hysteria2 提供 `server_ports`，未提供 `server_port` | 以第一个跳跃端口作为名义端点。 |

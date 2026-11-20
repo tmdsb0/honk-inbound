@@ -53,7 +53,9 @@ const ALPN_H3_WIRE: &[u8] = b"\x02h3";
 /// UDP payload size advertised to the edge. WARP endpoints carry 1280-byte IP
 /// packets plus QUIC/H3 overhead, so quinn's conservative 1252 default would
 /// cap path MTU growth below the tunnel MTU and could not carry a whole TUN
-/// packet. A detour re-frames each datagram inside the front node's stream
+/// packet. Real edges also answer handshakes with flights above the textbook
+/// 1280 bytes (1425 observed from Cloudflare), so the cap is 1452, quinn's
+/// path-MTU-discovery upper bound. A detour re-frames each datagram inside the front node's stream
 /// transport, but that framing does not enlarge the UDP datagram itself (TCP
 /// segments the stream), so the same cap applies on both paths.
 /// Alias of the shared fronted cap, so every QUIC-over-detour path
@@ -493,7 +495,7 @@ fn build_client_config(node: &Node, fronted: bool) -> anyhow::Result<ClientConfi
     transport.keep_alive_interval(Some(Duration::from_secs(15)));
     if fronted {
         // A detour carries whole UDP datagrams inside the front node's stream
-        // transport (TCP segments the stream, so 1350-byte datagrams arrive
+        // transport (TCP segments the stream, so 1452-byte datagrams arrive
         // intact), but quinn cannot run path MTU discovery through an
         // abstract socket: it stays at the 1200-byte initial MTU and rejects
         // every 1280-byte TUN IP packet as "datagram too large". That killed

@@ -164,7 +164,11 @@ pub(crate) async fn maybe_tls_wrap_concrete(
     detour: Option<&DetourPath>,
 ) -> anyhow::Result<MaybeTls> {
     let tls = node.tls().unwrap();
-    if !tls.alpn.is_empty() {
+    if !tls.alpn.is_empty()
+        || node
+            .transport()
+            .is_some_and(|transport| !transport.ws_headers.is_empty())
+    {
         node.validate_protocol()?;
     }
     let cold = tcp.is_none();
@@ -301,7 +305,7 @@ pub(crate) async fn maybe_tls_wrap_concrete(
     let mut tcp = ObservedTcp::new_carrier(carrier);
     if tls.enabled {
         let connector = crate::tls::build_connector(node)?;
-        let server_name = tls.sni.clone().unwrap_or_else(|| node.host().to_string());
+        let server_name = tls_server_name(node);
         let mut tls_stream = connector.connect(&server_name, tcp).await?;
         if node.is_xhttp() {
             anyhow::ensure!(
@@ -320,6 +324,45 @@ pub(crate) async fn maybe_tls_wrap_concrete(
         crate::runtime::flow_observation::Milestone::TransportReady,
     );
     Ok(MaybeTls::Plain(Box::new(tcp)))
+}
+
+/// TLS server name for a plain-TLS dial: an explicit SNI wins, then the
+/// WebSocket `Host` authority or the XHTTP `host` option, then the endpoint
+/// address.
+///
+/// CDN-fronted nodes carry the edge IP as their address and the distribution
+/// name only in the transport `Host` header. An IP-literal server name sends
+/// no SNI, so the edge answers with a default certificate that cannot match
+/// the distribution and verification fails.
+fn tls_server_name(node: &Node) -> String {
+    if let Some(sni) = node.tls().and_then(|tls| tls.sni.as_deref()) {
+        return sni.to_string();
+    }
+    node.transport()
+        .and_then(|transport| match transport.transport.as_str() {
+            "ws" => transport.ws_host.as_deref(),
+            "xhttp" => transport
+                .xhttp
+                .as_ref()
+                .and_then(|xhttp| xhttp.host.as_deref()),
+            _ => None,
+        })
+        .and_then(authority_bare_host)
+        .unwrap_or_else(|| node.host().to_string())
+}
+
+/// Bare host of an `Authority` value: a `:port` suffix is not SNI, and an
+/// empty or unparsable one falls through to the endpoint address.
+/// `Authority::host` keeps the brackets of an IPv6 literal; the connector
+/// recognises (and sends no SNI for) only the bare address.
+fn authority_bare_host(value: &str) -> Option<String> {
+    value.parse::<http::uri::Authority>().ok().map(|authority| {
+        authority
+            .host()
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .to_string()
+    })
 }
 
 fn encode_uri_path(path: &str) -> PercentEncode<'_> {
@@ -387,6 +430,15 @@ async fn wrap_ws(
             .parse()
             .map_err(|e| anyhow::anyhow!("invalid WebSocket host header: {}", e))?,
     );
+    for (name, value) in &transport.ws_headers {
+        request.headers_mut().insert(
+            name.parse::<tokio_tungstenite::tungstenite::http::HeaderName>()
+                .map_err(|e| anyhow::anyhow!("invalid WebSocket header name: {}", e))?,
+            value
+                .parse::<tokio_tungstenite::tungstenite::http::HeaderValue>()
+                .map_err(|e| anyhow::anyhow!("invalid WebSocket header value: {}", e))?,
+        );
+    }
 
     let (ws_stream, _response) = tokio_tungstenite::client_async(request, stream)
         .await

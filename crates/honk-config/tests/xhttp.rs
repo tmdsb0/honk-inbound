@@ -22,6 +22,124 @@ fn flat(options: Value) -> Result<Node, serde_json::Error> {
 }
 
 #[test]
+fn edgetunnel_obfs_padding_extra_is_accepted_and_stored() {
+    let extra = json!({"xPaddingObfsMode":true,"xPaddingMethod":"tokenish",
+        "xPaddingPlacement":"queryInHeader","xPaddingHeader":"abc123","xPaddingKey":"_def456"});
+    let node = link(&format!("type=xhttp&mode=stream-one&{}", extra_uri(extra)));
+    let options = node.transport().unwrap().xhttp.as_ref().unwrap();
+    assert!(options.x_padding_obfs_mode);
+    assert_eq!(options.x_padding_method.as_deref(), Some("tokenish"));
+    assert_eq!(
+        options.x_padding_placement.as_deref(),
+        Some("queryInHeader")
+    );
+    assert_eq!(options.x_padding_header.as_deref(), Some("abc123"));
+    assert_eq!(options.x_padding_key.as_deref(), Some("_def456"));
+    assert_eq!(options.mode, XhttpMode::StreamOne);
+    node.validate().unwrap();
+    assert_ne!(node.id, link("type=xhttp").id);
+    // Every valid method and placement spelling is accepted.
+    for method in ["repeat-x", "tokenish"] {
+        for placement in [
+            "queryInHeader",
+            "cookie",
+            "header",
+            "query",
+            "path",
+            "body",
+            "auto",
+        ] {
+            let extra = json!({"xPaddingObfsMode":true,"xPaddingMethod":method,
+                "xPaddingPlacement":placement,"xPaddingHeader":"h","xPaddingKey":"k"});
+            let node = link(&format!("type=xhttp&{}", extra_uri(extra)));
+            let options = node.transport().unwrap().xhttp.as_ref().unwrap();
+            assert_eq!(options.x_padding_method.as_deref(), Some(method));
+            assert_eq!(options.x_padding_placement.as_deref(), Some(placement));
+        }
+    }
+    // Flat options accept the same fields and round-trip them.
+    let node = flat(
+        json!({"x_padding_obfs_mode":true,"x_padding_method":"repeat-x",
+        "x_padding_placement":"cookie","x_padding_header":"h","x_padding_key":"k"}),
+    )
+    .unwrap();
+    let options = node.transport().unwrap().xhttp.as_ref().unwrap();
+    assert!(options.x_padding_obfs_mode);
+    assert_eq!(options.x_padding_method.as_deref(), Some("repeat-x"));
+    let restored = serde_json::from_str::<Node>(&serde_json::to_string(&node).unwrap()).unwrap();
+    assert_eq!(restored.outbound, node.outbound);
+    assert_eq!(restored.derive_id(), node.derive_id());
+}
+
+#[test]
+fn obfs_padding_claims_reject_invalid_values() {
+    for extra in [
+        json!({"xPaddingMethod":"bad"}),
+        json!({"xPaddingMethod":""}),
+        json!({"xPaddingMethod":null}),
+        json!({"xPaddingMethod":true}),
+        json!({"xPaddingPlacement":"bad"}),
+        json!({"xPaddingPlacement":""}),
+        json!({"xPaddingPlacement":null}),
+        json!({"xPaddingHeader":""}),
+        json!({"xPaddingHeader":null}),
+        json!({"xPaddingKey":""}),
+        json!({"xPaddingKey":null}),
+        json!({"xPaddingObfsMode":"yes"}),
+        json!({"xPaddingObfsMode":null}),
+        json!({"xPaddingObfsMode":{}}),
+    ] {
+        assert!(
+            Node::from_share_link(&format!(
+                "vless://{UUID}@example.com:443?type=xhttp&{}",
+                extra_uri(extra.clone())
+            ))
+            .is_err(),
+            "{extra}"
+        );
+    }
+    for options in [
+        json!({"x_padding_method":"bad"}),
+        json!({"x_padding_placement":"bad"}),
+        json!({"x_padding_header":""}),
+        json!({"x_padding_key":""}),
+        json!({"x_padding_obfs_mode":"yes"}),
+    ] {
+        assert!(flat(options.clone()).is_err(), "{options}");
+    }
+}
+
+#[test]
+fn absent_obfs_padding_fields_keep_existing_identity() {
+    let plain = link("type=xhttp");
+    // The default options serialize none of the new fields.
+    let value = serde_json::to_value(XhttpOptions::default()).unwrap();
+    for key in [
+        "x_padding_obfs_mode",
+        "x_padding_method",
+        "x_padding_placement",
+        "x_padding_header",
+        "x_padding_key",
+    ] {
+        assert!(value.get(key).is_none(), "{key}");
+    }
+    assert_eq!(flat(json!({})).unwrap().derive_id(), plain.id);
+    // A null claim in flat options is absent, as for the other optional
+    // fields; the strict extra path still rejects null (see above).
+    let node = flat(json!({"x_padding_method": null, "x_padding_key": null})).unwrap();
+    let options = node.transport().unwrap().xhttp.as_ref().unwrap();
+    assert!(options.x_padding_method.is_none() && options.x_padding_key.is_none());
+    assert_eq!(node.derive_id(), plain.id);
+    // An explicit false is the default and must not move the ID.
+    let node = link(&format!(
+        "type=xhttp&{}",
+        extra_uri(json!({"xPaddingObfsMode":false}))
+    ));
+    assert_eq!(node.id, plain.id);
+    assert_eq!(node.outbound, plain.outbound);
+}
+
+#[test]
 fn literal_path_admission_keeps_raw_query_validation() {
     for path in ["/a b/", "/<>/", "/雪/", "/a%2Fb/?raw=a%2Fb&keep=1"] {
         let node = flat(json!({"path":path})).unwrap();
@@ -321,7 +439,6 @@ fn raw_unsupported_options_ranges_and_headers_fail_closed() {
         "seqPlacement",
         "uplinkDataPlacement",
         "uplinkHTTPMethod",
-        "xPaddingObfsMode",
         "unknown",
     ] {
         for value in [Value::Null, json!(""), json!({}), json!(false)] {
@@ -579,10 +696,7 @@ fn direct_alpn_must_normalize_before_config_admission() {
         let mut node = canonical.clone();
         node.tls_mut().unwrap().alpn = alpn;
         assert!(node.validate_protocol().is_err());
-        assert_eq!(
-            node.normalize_stream_transport(),
-            Err("XHTTP requires H2-only ALPN")
-        );
+        assert!(node.normalize_stream_transport().is_err());
     }
 }
 

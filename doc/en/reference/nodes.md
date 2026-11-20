@@ -70,6 +70,8 @@ Tuning and display metadata do not participate, except VLESS multiplex limits th
 
 For XHTTP, identity also includes the effective TLS/plaintext posture and every accepted canonical XHTTP option, including headers, padding and POST pacing. Input aliases, header-name casing and equivalent range representations normalize before derivation. Existing TCP/WS/gRPC identity material is unchanged by adding XHTTP.
 
+For WebSocket, a nonempty canonical header map also joins identity. Header-name casing, insertion order and equal-value aliases do not change it; different values do. An absent or empty map preserves the previous identity.
+
 Before joining, each raw credential and dial-shape field and the effective host escapes `\` as `\\` and `|` as `\|`. Joined fingerprints are not escaped again. For nodes accepted by `Config::validate`, different identity fields produce different hash material. This guarantee does not cover nodes rejected by full configuration validation, even if `Node::from_share_link` can derive their IDs.
 
 **Breaking upgrade:** every successfully re-derived VLESS node receives a new ID, including links that never specified `vless_mode`, UDP-disabled nodes, and nodes with ALPN overrides. ID-keyed health and warm/session state is rebuilt. Other protocols change ID only when `|` or `\` occurs in the pipe-joined identity fields; delimiters in ALPN alone do not trigger that change because ALPN uses a separate JSON child-UUID step.
@@ -121,6 +123,7 @@ The Node model exposes the fields below. Share links populate operator-facing fi
 | `flow` | string? | null | VLESS `xtls-rprx-vision` or `xtls-rprx-vision-udp443`; Shadowrocket `xtls=2` selects the base flow |
 | `network` | string? | null | Packet capability for supported protocols; independent of VMess JSON `net` and other stream-transport fields |
 | `ws_path` / `ws_host` | string? | null | WebSocket `path` and Host header |
+| `ws_headers` | object | `{}`; omitted on output | Additional upgrade headers as a string map, normalized to lowercase names; equal-value aliases merge and conflicting aliases reject. At most 64 entries and 16 KiB of name+value bytes; control bytes reject. Reserved names: `host`, `connection`, `upgrade`, `sec-websocket-key`, `sec-websocket-version`, `sec-websocket-extensions`, `sec-websocket-accept`, `sec-websocket-protocol`, `content-length`, `transfer-encoding`. Nonempty maps on non-WebSocket stream transports reject; protocols without a stream transport drop the field. Null is invalid. Only subscriptions and structured input supply headers; no share-link dialect carries them. |
 | `grpc_service` | string? | null | gRPC `serviceName` or `service_name` |
 | `xhttp` | object? | omitted | Canonical XHTTP options in flat structured input/output; options on another transport reject |
 | `hy2_auth` / `hy2_obfs` | string? | null | Hysteria2 authentication and salamander password |
@@ -297,7 +300,7 @@ Stream-capable share links select transport with `type=` or its `network=` alias
 | Value | Transport | Field mapping |
 | --- | --- | --- |
 | Empty or `tcp` | Raw TCP | — |
-| `ws` | WebSocket | `path` → `ws_path`; `host` → `ws_host` |
+| `ws` | WebSocket | `path` → `ws_path`; `host` → `ws_host`; upgrade headers have no share-link field |
 | `grpc` | gRPC | `serviceName` or `service_name` → `grpc_service` |
 | `xhttp` or input alias `splithttp` | XHTTP | See the H2 profile below. |
 
@@ -376,6 +379,11 @@ URI `extra` accepts a percent-encoded JSON object containing `host`, `path` and 
 | `noGRPCHeader` | `no_grpc_header` | `false` | Boolean |
 | `scMaxEachPostBytes` | `sc_max_each_post_bytes` | `1000000` | 1–16777216 bytes |
 | `scMinPostsIntervalMs` | `sc_min_posts_interval_ms` | `30` | 0–60000 ms; zero disables the minimum interval |
+| `xPaddingObfsMode` | `x_padding_obfs_mode` | `false` | Boolean; when true and method, placement, header and key are all set, the dialer sends the obfs padding instead of the Referer padding |
+| `xPaddingMethod` | `x_padding_method` | absent | `repeat-x` or `tokenish` |
+| `xPaddingPlacement` | `x_padding_placement` | absent | `queryInHeader`, `cookie`, `header`, `query`, `path`, `body` or `auto` |
+| `xPaddingHeader` | `x_padding_header` | absent | Nonempty header name carrying the padding |
+| `xPaddingKey` | `x_padding_key` | absent | Nonempty query key carrying the padding |
 
 Ranges accept an unsigned scalar, a `min-max` string or `{"min":N,"max":N}` in structured input. Headers normalize to lowercase and equal aliases coalesce; conflicting aliases, control characters and protocol-managed headers (`host`, `content-type`, `content-length`, `referer`, hop-by-hop headers and trailers) reject. URI/VMess extra JSON rejects duplicate members before map construction. Padding remains enabled. The bounds are local safety limits, not a guarantee that a peer or CDN accepts every value.
 
@@ -400,7 +408,7 @@ Top-level `host`, `path` and `mode` remain authoritative when `extra` is present
 | Extra `noSSEHeader`, `scMaxBufferedPosts`, `scStreamUpServerSecs` | Server-only Xray settings; type-checked and dropped. |
 | `xmux` | Accepted and dropped only when all-zero or exactly Xray's fill-in for omitted XMUX: `maxConcurrency` 1, `hMaxRequestTimes` 600–900, `hMaxReusableSecs` 1800–3000, everything else 0. Other values reject. |
 
-Unknown or unsupported options reject the entire node, even when null or empty. These include alternate session/sequence/payload placement, custom upload methods and padding-obfuscation profiles. Mihomo subscriptions use the corresponding `xhttp-opts` fields. Official sing-box and client-record XHTTP transports remain unsupported.
+Unknown or unsupported options reject the entire node, even when null or empty. These include alternate session/sequence/payload placement and custom upload methods. Mihomo subscriptions use the corresponding `xhttp-opts` fields. Official sing-box and client-record XHTTP transports remain unsupported.
 
 Extra `downloadSettings` is an Xray StreamConfig that sends the GET to a separate endpoint. It inherits nothing from the upload side, including configured headers. Download GETs therefore carry the default Chrome `fetch()` set even when upload requests have a configured `User-Agent`.
 
@@ -439,7 +447,7 @@ The query mapping follows the [Shadowrocket exporter](https://github.com/cedar20
 
 Conflicting TLS/REALITY, flow, or transport declarations are rejected rather than silently downgraded. `obfs` accepts only empty/`none`, `websocket`, or `grpc` for VLESS; unsupported transports are not reinterpreted as TCP. Canonical `host` and `serviceName`/`service_name` fields retain their existing fallback precedence. Explicit SNI aliases are compared before assignment; equal bytes coalesce, unequal names reject without case rewriting. Empty or whitespace-only SNI and flow normalize to absent before node-ID derivation. Nonempty flow must be `xtls-rprx-vision` or `xtls-rprx-vision-udp443`.
 
-Clash imports compare `servername`, `server-name`, and `sni`; record imports additionally compare `tls-name` and `tls-host`, retaining `obfs_sni` as a lower-priority fallback, including Quantumult X WSS Host. Record `off` remains invalid. In share links and VMess JSON, WebSocket `host` is only the Host header; outside WebSocket it is a lower-priority SNI fallback. The endpoint hostname remains the final TLS consumer fallback.
+Clash imports compare `servername`, `server-name`, and `sni`; record imports additionally compare `tls-name` and `tls-host`, retaining `obfs_sni` as a lower-priority fallback, including Quantumult X WSS Host. Record `off` remains invalid. In share links and VMess JSON, WebSocket `host` is stored only as the Host header; outside WebSocket it is a lower-priority SNI fallback. At dial time an ordinary TLS connection sends the explicit `sni` when set, otherwise a nonempty WebSocket `Host` or XHTTP `host` authority with any port dropped, otherwise the endpoint hostname; a CDN-fronted node therefore verifies the distribution certificate named in the header, not its edge address.
 
 ### Hysteria2
 

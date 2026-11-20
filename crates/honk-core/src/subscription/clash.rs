@@ -515,20 +515,21 @@ fn apply_stream(mapping: &Mapping, node: &mut Node, udp: Option<bool>) -> Result
                 let headers = headers
                     .as_mapping()
                     .ok_or("ws-opts.headers must be a mapping")?;
+                let mut ws_host = None;
                 for (key, value) in headers {
                     let key = key.as_str().ok_or("websocket header name is invalid")?;
-                    if !key.eq_ignore_ascii_case("host")
-                        && !matches!(value, serde_yaml::Value::Null)
-                    {
-                        return Err("unsupported websocket header");
+                    if key.eq_ignore_ascii_case("host") {
+                        if ws_host.is_none() {
+                            ws_host = yaml_text(value)
+                                .ok()
+                                .flatten()
+                                .filter(|value| !value.trim().is_empty());
+                        }
+                    } else if let Some(value) = yaml_text(value)? {
+                        transport.ws_headers.insert(key.to_owned(), value);
                     }
                 }
-                transport.ws_host = headers.iter().find_map(|(key, value)| {
-                    key.as_str()
-                        .filter(|key| key.eq_ignore_ascii_case("host"))
-                        .and_then(|_| yaml_text(value).ok().flatten())
-                        .filter(|value| !value.trim().is_empty())
-                });
+                transport.ws_host = ws_host;
             }
         }
         transport.ws_path = transport
@@ -740,7 +741,8 @@ pub(super) fn parse_clash_proxy(
     mapping: &Mapping,
     subscription_id: Option<uuid::Uuid>,
     tuic_default_alpn: Option<&str>,
-) -> Result<Node, &'static str> {
+) -> Result<Node, (Option<&'static str>, &'static str)> {
+    let entry_error = |message| (None, message);
     let ProxySource {
         protocol,
         name,
@@ -749,7 +751,7 @@ pub(super) fn parse_clash_proxy(
         udp,
         tls_explicit,
         tls_enabled,
-    } = validate_source(mapping)?;
+    } = validate_source(mapping).map_err(entry_error)?;
     let mut node = Node {
         name,
         address: format!("{server}:{port}"),
@@ -760,24 +762,26 @@ pub(super) fn parse_clash_proxy(
         ..Default::default()
     };
 
-    apply_protocol(mapping, &mut node)?;
+    apply_protocol(mapping, &mut node).map_err(entry_error)?;
     // A detour belongs to the path, not to the protocol: mihomo spells it
     // `dialer-proxy`, sing-box `detour`. Every protocol reads it here, so a
     // MASQUE node keeps exactly the behaviour it had when the field lived in
     // its own config, and the other protocols pick it up as the shared dial
     // entry point lands.
-    node.detour = yaml_text_alias(mapping, &["dialer-proxy", "dialer_proxy", "detour"])?
+    node.detour = yaml_text_alias(mapping, &["dialer-proxy", "dialer_proxy", "detour"])
+        .map_err(entry_error)?
         .filter(|value| !value.trim().is_empty());
-    apply_stream(mapping, &mut node, udp)?;
-    apply_tls(mapping, &mut node, protocol, tls_explicit, tls_enabled)?;
-    apply_quic(mapping, &mut node, tuic_default_alpn)?;
-    node.normalize_stream_transport()?;
+    apply_stream(mapping, &mut node, udp).map_err(entry_error)?;
+    apply_tls(mapping, &mut node, protocol, tls_explicit, tls_enabled).map_err(entry_error)?;
+    apply_quic(mapping, &mut node, tuic_default_alpn).map_err(entry_error)?;
+    node.normalize_stream_transport()
+        .map_err(|(field, message)| (Some(field), message))?;
     if let Some(config) = node.vless_mut() {
         config.normalize();
     }
-    validate_imported_node(&node)?;
+    validate_imported_node(&node).map_err(entry_error)?;
     node.validate()
-        .map_err(|_| "invalid imported node protocol settings")?;
+        .map_err(|_| (None, "invalid imported node protocol settings"))?;
     node.id = node.derive_id();
     Ok(node)
 }
